@@ -27,6 +27,8 @@ const {
   normalizeThreshold,
   resolveModelName,
   pickBestNum,
+  isPrivateOrLoopbackUrl,
+  isZeroMarginalCostSource,
   estimateRawTokensUsd,
   mergeUsageSources,
   estimateSessionCost,
@@ -289,27 +291,100 @@ describe('mergeUsageSources', () => {
 });
 
 describe('estimateRawTokensUsd & estimateSessionCost', () => {
-  it('matches known model families and returns null for unknown or empty inputs', () => {
-    // Claude Sonnet: [3.0, 15.0, 0.3]
+  it('matches official Google Cloud / AI Studio rates (including Carbon schedule & 200k tier) and returns null for unknown/empty inputs', () => {
+    const nov2026 = Date.UTC(2026, 10, 27, 0, 0, 0);
+    const dec2026 = Date.UTC(2026, 11, 1, 0, 0, 0);
+    const jan2027 = Date.UTC(2027, 0, 2, 0, 0, 0);
+
+    // Gemini 4 Carbon: $2/$10/$0.10 intro through Nov 30, 2026; $4/$20/$0.20 from Dec 1, 2026
+    approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'gemini-4-carbon', null, null, 0, null, nov2026), 12.0);
+    approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'gemini-4-carbon', 500_000, null, 0, null, dec2026), 22.1);
+    // Gemini 4 Neon ($3/$15/$0.15) & Hydrogen ($1.5/$7.5/$0.075)
+    approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'gemini-4-neon'), 18.0);
+    approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'gemini-4-hydrogen'), 9.0);
+    // Gemini 3.8 Flash promo ($0.75/$3.75) vs 2027 standard ($1.50/$7.50) & 3.1 Flash-Lite ($0.25/$1.50)
+    approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'gemini-3.8-flash', null, null, 0, null, nov2026), 4.5);
+    approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'gemini-3.8-flash', null, null, 0, null, jan2027), 9.0);
+    approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'gemini-3.1-flash-lite'), 1.75);
+    // Gemini 2.5 Flash Lite ($0.10/$0.40), 2.5 Flash ($0.15/$0.60), 2.5 Pro (<=200k $1.25/$10, >200k $2.50/$15)
+    approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'gemini-2.5-flash-lite'), 0.5);
+    approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'gemini-2.5-flash'), 0.75);
+    approxEqual(estimateRawTokensUsd(100_000, 100_000, 'gemini-2.5-pro'), 1.125);
+    approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'gemini-2.5-pro'), 17.5);
+    // Claude Sonnet 4 ($3/$15), Opus 4.8 ($5/$25), legacy Opus 4 ($15/$75)
     approxEqual(estimateRawTokensUsd(1_000_000, 200_000, 'claude-sonnet-4'), 6.0);
-    // Claude Opus: [15.0, 75.0, 1.5]
+    approxEqual(estimateRawTokensUsd(1_000_000, 100_000, 'claude-opus-4-8'), 7.5);
     approxEqual(estimateRawTokensUsd(1_000_000, 100_000, 'anthropic/claude-opus-4'), 22.5);
-    // Gemini Flash Lite vs Flash vs Pro
-    approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'gemini-2.5-flash-lite'), 0.75);
-    approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'gemini-2.5-flash'), 2.8);
-    approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'gemini-2.5-pro'), 11.25);
-    // GPT-4o-mini vs GPT-5/Codex vs o3
+    // GPT-4o-mini vs GPT-5/Codex vs o3 (direct pay-as-you-go API)
     approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'gpt-4o-mini'), 0.75);
     approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'openai/gpt-5-codex'), 12.5);
     approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'o3'), 50.0);
-    // DeepSeek R1 vs DeepSeek Chat
+    // DeepSeek R1 vs DeepSeek Chat (V4 Flash rate)
     approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'deepseek-r1'), 2.74);
-    approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'deepseek-chat'), 1.37);
+    approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'deepseek-chat'), 0.75);
 
     assert.equal(estimateRawTokensUsd(0, 0, 'claude-sonnet-4'), null);
     assert.equal(estimateRawTokensUsd(null, undefined, 'claude-sonnet-4'), null);
     assert.equal(estimateRawTokensUsd(1000, 500, ''), null);
     assert.equal(estimateRawTokensUsd(1000, 500, 'unknown-local-model-v1'), null);
+  });
+
+  it('treats ChatGPT subscription (openai-codex / chatgpt-sub / OpenCodex loopback) and local LAN models as $0.00 marginal cost', () => {
+    assert.equal(isPrivateOrLoopbackUrl('http://127.0.0.1:10100/v1'), true);
+    assert.equal(isPrivateOrLoopbackUrl('http://192.168.1.6:11434/v1'), true);
+    assert.equal(isPrivateOrLoopbackUrl('https://generativelanguage.googleapis.com/v1beta'), false);
+
+    assert.equal(isZeroMarginalCostSource({ billing_provider: 'openai-codex' }), true);
+    assert.equal(isZeroMarginalCostSource({ provider: 'custom:chatgpt-sub' }), true);
+    assert.equal(isZeroMarginalCostSource({ billing_base_url: 'http://127.0.0.1:10100/v1' }), true);
+    assert.equal(isZeroMarginalCostSource({ cost_status: 'included' }), true);
+    assert.equal(isZeroMarginalCostSource({ billing_provider: 'gemini', billing_base_url: 'https://generativelanguage.googleapis.com/v1beta' }), false);
+
+    // Subscription session with 500k tokens resolves to exact $0.00 (not estimated OpenAI API rate)
+    const mergedSub = mergeUsageSources(
+      { input: 400_000, output: 100_000 },
+      {},
+      { billing_provider: 'custom:chatgpt-sub', billing_base_url: 'http://127.0.0.1:10100/v1' },
+      {}
+    );
+    assert.equal(mergedSub.backendCost, 0);
+    assert.deepEqual(estimateSessionCost(mergedSub, 'gpt-6.2-sol'), { amount: 0, estimated: false });
+
+    // Multi-session aggregation: Google API bill ($1.80) + ChatGPT subscription ($0.00) stays exact $1.80
+    const now = Date.UTC(2026, 10, 27, 12, 0, 0);
+    const agg = aggregatePersistedSessions(
+      [
+        {
+          id: 'gem-1',
+          last_activity_at: now - 1000,
+          input_tokens: 100_000,
+          output_tokens: 100_000,
+          estimated_cost_usd: 1.8,
+          billing_provider: 'gemini',
+          model: 'gemini-4-neon',
+        },
+        {
+          id: 'sub-1',
+          last_activity_at: now - 500,
+          input_tokens: 500_000,
+          output_tokens: 80_000,
+          estimated_cost_usd: null,
+          billing_provider: 'custom:chatgpt-sub',
+          billing_base_url: 'http://127.0.0.1:10100/v1',
+          model: 'gpt-6.2-sol',
+        },
+      ],
+      'today',
+      [],
+      null,
+      '',
+      now
+    );
+    assert.equal(agg.sessionCount, 2);
+    assert.equal(agg.input, 600_000);
+    assert.equal(agg.output, 180_000);
+    approxEqual(agg.costUsd, 1.8);
+    assert.equal(agg.estimated, false);
   });
 
   it('applies cache discounts using cacheRead or cacheHitPct without negative fresh input', () => {

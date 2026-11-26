@@ -93,6 +93,8 @@ export const __test = {
   normalizeThreshold,
   resolveModelName,
   pickBestNum,
+  isPrivateOrLoopbackUrl,
+  isZeroMarginalCostSource,
   estimateRawTokensUsd,
   mergeUsageSources,
   estimateSessionCost,

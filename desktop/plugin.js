@@ -368,22 +368,90 @@ const CATEGORY_COLORS = {
 const MONO_OPACITIES = [0.85, 0.56, 0.40, 0.30, 0.22, 0.16, 0.12];
 const PRISM_FALLBACK_COLORS = ['#7c3aed', '#5b73d6', '#4c93ad', '#7b8498', '#9c71b5', '#53947c'];
 
+// Scheduled Google official API rate transitions (UTC):
+// - Gemini 4 Carbon / Argon intro ($2/$10/$0.10) through 2026-11-30; standard ($4/$20/$0.20) from 2026-12-01.
+// - Gemini 3.8 / 3.7 Flash promo ($0.75/$3.75/$0.075) through 2026-12-31; standard ($1.50/$7.50/$0.15) from 2027-01-01.
+const GEMINI_4_CARBON_STD_AT_MS = Date.UTC(2026, 11, 1, 0, 0, 0);
+const GEMINI_38_FLASH_STD_AT_MS = Date.UTC(2027, 0, 1, 0, 0, 0);
+
+// Per-1M USD fallback rates: [input, output, cacheRead, optionalTierRule]
+// Aligned with Google AI / Cloud Billing official pricing (https://ai.google.dev/gemini-api/docs/pricing)
+// and Hermes v0.23.4 agent/usage_pricing.py official snapshots.
 const MODEL_PRICING = [
-  [/gemini.*(flash-lite|hydrogen)/i, [0.15, 0.6, 0.0375]],
-  [/gemini.*flash/i, [0.3, 2.5, 0.075]],
-  [/gemini.*(pro|neon|ultra)/i, [1.25, 10.0, 0.3125]],
+  // --- Google Gemini 4 Official API ---
+  [
+    /gemini[-./]*4[-.]*(carbon|argon)/i,
+    [2.0, 10.0, 0.1, { effectiveAtMs: GEMINI_4_CARBON_STD_AT_MS, nextRates: [4.0, 20.0, 0.2] }],
+  ],
+  [/gemini[-./]*4[-.]*neon/i, [3.0, 15.0, 0.15]],
+  [/gemini[-./]*4[-.]*hydrogen/i, [1.5, 7.5, 0.075]],
+  // --- Google Gemini 3.x Official API ---
+  [
+    /gemini[-./]*3\.(8|7)[-.]*flash/i,
+    [0.75, 3.75, 0.075, { effectiveAtMs: GEMINI_38_FLASH_STD_AT_MS, nextRates: [1.5, 7.5, 0.15] }],
+  ],
+  [/gemini[-./]*3\.6[-.]*flash/i, [1.5, 7.5, 0.15]],
+  [/gemini[-./]*3\.5[-.]*flash[-.]*lite/i, [0.3, 2.5, 0.03]],
+  [/gemini[-./]*3\.5[-.]*flash/i, [1.5, 9.0, 0.15]],
+  [/gemini[-./]*3\.1[-.]*flash[-.]*lite/i, [0.25, 1.5, 0.025]],
+  [/gemini[-./]*3(\.1)?[-.]*pro/i, [2.0, 12.0, 0.2]],
+  [/gemini[-./]*3[-.]*flash/i, [0.5, 3.0, 0.05]],
+  // --- Google Gemini 2.5 / 2.0 Official API ---
+  [
+    /gemini[-./]*2\.5[-.]*pro/i,
+    [1.25, 10.0, 0.125, { tierThresholdTokens: 200_000, aboveRates: [2.5, 15.0, 0.25] }],
+  ],
+  [/gemini[-./]*2\.5[-.]*flash[-.]*lite/i, [0.1, 0.4, 0.01]],
+  [/gemini[-./]*2\.5[-.]*flash/i, [0.15, 0.6, 0.015]],
+  [/gemini[-./]*2\.0[-.]*flash/i, [0.1, 0.4, 0.01]],
+  [/gemini.*flash[-.]*lite/i, [0.25, 1.5, 0.025]],
+  [/gemini.*flash/i, [0.75, 3.75, 0.075]],
+  [/gemini.*(pro|ultra)/i, [2.0, 12.0, 0.2]],
+  // --- Anthropic Claude ---
+  [/claude[-./]*(fable|mythos)[-./]*5/i, [8.0, 40.0, 0.2]],
+  [/claude[-./]*opus[-./]*5[-.]*5/i, [4.0, 20.0, 0.2]],
+  [/claude[-./]*opus[-./]*4[-.]*8[-.]*fast/i, [10.0, 50.0, 1.0]],
+  [/claude[-./]*opus[-./]*(4[-.](5|6|7|8)|5\b)/i, [5.0, 25.0, 0.5]],
   [/claude.*opus/i, [15.0, 75.0, 1.5]],
   [/claude.*sonnet/i, [3.0, 15.0, 0.3]],
+  [/claude[-./]*haiku[-./]*4[-.]*5/i, [1.0, 5.0, 0.1]],
   [/claude.*haiku/i, [0.8, 4.0, 0.08]],
-  [/gpt-4o-mini|o4-mini|o3-mini/i, [0.15, 0.6, 0.075]],
-  [/gpt-4o|gpt-5|gpt-6|codex|astra|sol/i, [2.5, 10.0, 1.25]],
+  // --- OpenAI Pay-As-You-Go API (subscription routes short-circuit to $0 before this table) ---
+  [/gpt-5\.6-sol/i, [5.0, 30.0, 0.5]],
+  [/gpt-5\.6-terra/i, [2.5, 15.0, 0.25]],
+  [/gpt-5\.6-luna/i, [1.0, 6.0, 0.1]],
+  [/gpt-4\.1-nano/i, [0.1, 0.4, 0.025]],
+  [/gpt-4\.1-mini/i, [0.4, 1.6, 0.1]],
+  [/gpt-4\.1/i, [2.0, 8.0, 0.5]],
+  [/gpt-4o-mini|o4-mini/i, [0.15, 0.6, 0.075]],
+  [/o3-mini/i, [1.1, 4.4, 0.55]],
+  [/gpt-4o|gpt-5|gpt-6|codex|astra|sol|terra|luna/i, [2.5, 10.0, 1.25]],
   [/\bo1\b|\bo3\b/i, [10.0, 40.0, 2.5]],
+  // --- DeepSeek / Others ---
+  [/deepseek[-./]*v4[-.]*pro/i, [0.66, 1.98, 0.022]],
+  [/deepseek[-./]*v4[-.]*flash/i, [0.15, 0.6, 0.003]],
   [/deepseek.*(r1|reasoner)/i, [0.55, 2.19, 0.14]],
-  [/deepseek/i, [0.27, 1.1, 0.07]],
+  [/deepseek/i, [0.15, 0.6, 0.003]],
   [/kimi|moonshot/i, [0.6, 2.5, 0.15]],
   [/glm/i, [0.5, 2.0, 0.1]],
   [/qwen/i, [0.4, 1.2, 0.1]],
 ];
+
+const ZERO_MARGINAL_PROVIDERS = new Set([
+  'openai-codex',
+  'chatgpt-sub',
+  'custom:chatgpt-sub',
+  'opencodex',
+  'custom:opencodex',
+  'claude-code',
+  'xai-oauth',
+  'ollama',
+  'vllm',
+  'llamacpp',
+  'llama.cpp',
+  'llama-cpp',
+  'local',
+]);
 
 const STYLES = `
 @keyframes lub-silk-sheen {
@@ -1409,14 +1477,79 @@ function pickBestNum(...vals) {
   return firstNum;
 }
 
-function estimateRawTokensUsd(input, output, modelName, cacheRead = null, cacheHitPct = null, reasoning = 0, total = null) {
+function isPrivateOrLoopbackUrl(rawUrl) {
+  if (typeof rawUrl !== 'string' || !rawUrl.trim()) return false;
+  try {
+    const u = new URL(rawUrl.trim());
+    const hostName = u.hostname.toLowerCase().replace(/^\[|\]$/g, '');
+    if (
+      hostName === 'localhost' ||
+      hostName === '127.0.0.1' ||
+      hostName === '::1' ||
+      hostName === '0.0.0.0' ||
+      hostName.endsWith('.local')
+    ) {
+      return true;
+    }
+    if (
+      /^10\.\d+\.\d+\.\d+$/.test(hostName) ||
+      /^192\.168\.\d+\.\d+$/.test(hostName) ||
+      /^100\.\d+\.\d+\.\d+$/.test(hostName)
+    ) {
+      return true;
+    }
+    const m172 = hostName.match(/^172\.(\d+)\.\d+\.\d+$/);
+    if (m172 && Number(m172[1]) >= 16 && Number(m172[1]) <= 31) return true;
+  } catch {}
+  return false;
+}
+
+function isZeroMarginalCostSource(...sources) {
+  for (const src of sources) {
+    if (!src || typeof src !== 'object') continue;
+    const costStatus = String(src.cost_status ?? src.costStatus ?? '').trim().toLowerCase();
+    const billingMode = String(src.billing_mode ?? src.billingMode ?? '').trim().toLowerCase();
+    if (costStatus === 'included' || billingMode === 'subscription_included') return true;
+    const prov = String(src.billing_provider ?? src.billingProvider ?? src.provider ?? '').trim().toLowerCase();
+    if (prov && (ZERO_MARGINAL_PROVIDERS.has(prov) || prov.includes('chatgpt-sub') || prov.includes('opencodex'))) {
+      return true;
+    }
+    const bUrl = src.billing_base_url ?? src.billingBaseUrl ?? src.base_url ?? src.baseUrl ?? '';
+    if (isPrivateOrLoopbackUrl(bUrl)) return true;
+  }
+  return false;
+}
+
+function resolveModelRates(entryRates, promptTokens, nowMs) {
+  let [inRate, outRate, cacheRate, opts] = entryRates;
+  if (opts && typeof opts === 'object') {
+    if (opts.effectiveAtMs != null && Array.isArray(opts.nextRates) && nowMs >= opts.effectiveAtMs) {
+      [inRate, outRate, cacheRate] = opts.nextRates;
+    }
+    if (opts.tierThresholdTokens != null && Array.isArray(opts.aboveRates) && promptTokens > opts.tierThresholdTokens) {
+      [inRate, outRate, cacheRate] = opts.aboveRates;
+    }
+  }
+  return [inRate, outRate, cacheRate];
+}
+
+function estimateRawTokensUsd(
+  input,
+  output,
+  modelName,
+  cacheRead = null,
+  cacheHitPct = null,
+  reasoning = 0,
+  total = null,
+  nowMs = Date.now()
+) {
   const i = input ?? 0;
   const o = output ?? 0;
   if (i === 0 && o === 0) return null;
   if (!modelName) return null;
   const matched = MODEL_PRICING.find(([re]) => re.test(modelName));
   if (!matched) return null;
-  const [inRate, outRate, cacheRate] = matched[1];
+  const [inRate, outRate, cacheRate] = resolveModelRates(matched[1], i, nowMs);
   const cachedIn =
     cacheRead != null
       ? Math.min(i, cacheRead)
@@ -1484,11 +1617,18 @@ function mergeUsageSources(liveUsage, rpcUsage, persistedSession, breakdown) {
   const compressions = pickBestNum(a.compressions, b.compressions, b.compression_count, bd.compressions, ps.compression_count);
   const avgTps = pickBestNum(a.avg_tps, a.tokens_per_s, b.avg_tps, b.tokens_per_s);
   const avgLatency = pickBestNum(a.avg_latency_s, b.avg_latency_s);
-  const backendCost = pickBestNum(
+  const directBackendCost = pickBestNum(
     a.actual_cost_usd, a.cost_usd, a.estimated_cost_usd,
     b.actual_cost_usd, b.cost_usd, b.estimated_cost_usd,
     ps.actual_cost_usd, ps.cost_usd, ps.estimated_cost_usd
   );
+  const hasUsageActivity = (input ?? 0) > 0 || (output ?? 0) > 0 || (calls ?? 0) > 0;
+  const backendCost =
+    directBackendCost != null
+      ? directBackendCost
+      : hasUsageActivity && isZeroMarginalCostSource(a, b, ps)
+        ? 0
+        : null;
 
   return {
     input, output, reasoning, total, calls,
@@ -1498,8 +1638,12 @@ function mergeUsageSources(liveUsage, rpcUsage, persistedSession, breakdown) {
   };
 }
 
-function estimateSessionCost(merged, modelName) {
+function estimateSessionCost(merged, modelName, ...routeHints) {
   if (merged.backendCost != null) return { amount: merged.backendCost, estimated: false };
+  const hasTok = (merged.input ?? 0) > 0 || (merged.output ?? 0) > 0;
+  if (hasTok && isZeroMarginalCostSource(...routeHints)) {
+    return { amount: 0, estimated: false };
+  }
   const usd = estimateRawTokensUsd(
     merged.input, merged.output, modelName,
     merged.cacheRead, merged.cacheHitPct, merged.reasoning, merged.total
@@ -1508,7 +1652,15 @@ function estimateSessionCost(merged, modelName) {
   return { amount: usd, estimated: true };
 }
 
-function aggregatePersistedSessions(sessions, timeRange, activeCandidateIds, liveMerged, liveModelName, nowMs = Date.now()) {
+function aggregatePersistedSessions(
+  sessions,
+  timeRange,
+  activeCandidateIds,
+  liveMerged,
+  liveModelName,
+  nowMs = Date.now(),
+  ...liveRouteHints
+) {
   const cutoffMs = getTimeRangeCutoffMs(timeRange, nowMs);
   const activeSet = new Set((activeCandidateIds || []).filter(Boolean));
   const byId = new Map();
@@ -1516,7 +1668,7 @@ function aggregatePersistedSessions(sessions, timeRange, activeCandidateIds, liv
     if (!s || typeof s !== 'object') continue;
     const id = String(s.id || s.session_id || '');
     if (!id) continue;
-    const ts = toEpochMs(s.last_active) ?? toEpochMs(s.started_at);
+    const ts = toEpochMs(s.last_active ?? s.last_activity_at) ?? toEpochMs(s.started_at);
     if (cutoffMs > 0 && (ts == null || ts < cutoffMs)) continue;
     if (!byId.has(id)) byId.set(id, s);
   }
@@ -1542,10 +1694,23 @@ function aggregatePersistedSessions(sessions, timeRange, activeCandidateIds, liv
     }
 
     if (sCost == null && (sIn > 0 || sOut > 0)) {
-      const est = estimateRawTokensUsd(sIn, sOut, s.model || liveModelName);
-      if (est != null) {
-        sCost = est;
-        sEst = true;
+      if (isZeroMarginalCostSource(s, ...(activeSet.has(id) ? liveRouteHints : []))) {
+        sCost = 0;
+      } else {
+        const est = estimateRawTokensUsd(
+          sIn,
+          sOut,
+          s.model || liveModelName,
+          toNum(s.cache_read_tokens ?? s.cache_read ?? s.cached_tokens),
+          null,
+          toNum(s.reasoning_tokens) ?? 0,
+          null,
+          nowMs
+        );
+        if (est != null) {
+          sCost = est;
+          sEst = true;
+        }
       }
     }
 
@@ -1568,7 +1733,7 @@ function aggregatePersistedSessions(sessions, timeRange, activeCandidateIds, liv
     byId.set(primaryActiveId, { id: primaryActiveId });
     input += liveMerged.input ?? 0;
     output += liveMerged.output ?? 0;
-    const liveCost = estimateSessionCost(liveMerged, liveModelName);
+    const liveCost = estimateSessionCost(liveMerged, liveModelName, ...liveRouteHints);
     if (liveCost.amount != null) {
       costUsd += liveCost.amount;
       hasAnyCost = true;
@@ -2398,6 +2563,7 @@ function ContextBarChip({ ctx }) {
   const [policySchema, setPolicySchema] = React.useState(null);
   const [policyBusy, setPolicyBusy] = React.useState(false);
   const [policyNote, setPolicyNote] = React.useState(null);
+  const [profileRouteHint, setProfileRouteHint] = React.useState(null);
 
   const [botTitles, setBotTitles] = React.useState({});
   const [profileNames, setProfileNames] = React.useState([]);
@@ -2489,7 +2655,10 @@ function ContextBarChip({ ctx }) {
       const cfg = await readOfficialConfig(ownerConnId, profileSlug);
       if (reqId !== policyReqRef.current) return;
       if (cfg && typeof cfg === 'object') {
-        setPolicy(extractContextPolicy(cfg));
+        const inner = cfg.config && typeof cfg.config === 'object' ? cfg.config : cfg;
+        setPolicy(extractContextPolicy(inner));
+        const mSec = inner?.model && typeof inner.model === 'object' ? inner.model : {};
+        setProfileRouteHint({ provider: mSec.provider || '', base_url: mSec.base_url || '' });
         return;
       }
     } catch {}
@@ -2589,17 +2758,22 @@ function ContextBarChip({ ctx }) {
           } catch {}
         }
         if (!gotUsage) {
+          let u = null;
           try {
-            const u = await gwCall(route, 'session.usage', { session_id: sid });
-            if (u && typeof u === 'object') {
-              const hasData =
-                (toNum(u.total) ?? toNum(u.total_tokens) ?? 0) > 0 ||
-                (toNum(u.input) ?? toNum(u.input_tokens) ?? 0) > 0 ||
-                (toNum(u.context_max) ?? 0) > 0 ||
-                (toNum(u.calls) ?? toNum(u.api_calls) ?? 0) > 0;
-              if (hasData || sid === ids[ids.length - 1]) gotUsage = u;
-            }
-          } catch {}
+            u = await gwCall(route, 'session.usage', { session_id: sid });
+          } catch {
+            try {
+              u = await gwCall(route, 'session.stats', { session_id: sid });
+            } catch {}
+          }
+          if (u && typeof u === 'object') {
+            const hasData =
+              (toNum(u.total) ?? toNum(u.total_tokens) ?? 0) > 0 ||
+              (toNum(u.input) ?? toNum(u.input_tokens) ?? 0) > 0 ||
+              (toNum(u.context_max) ?? 0) > 0 ||
+              (toNum(u.calls) ?? toNum(u.api_calls) ?? 0) > 0;
+            if (hasData || sid === ids[ids.length - 1]) gotUsage = u;
+          }
         }
         if (gotBreakdown && gotUsage) break;
       }
@@ -2852,12 +3026,25 @@ function ContextBarChip({ ctx }) {
   const categories = normalizeCategories(breakdown, prefs.themeSkin, t);
   const modelName = resolveModelName(liveUsage, rpcUsage, persistedSession, rawModel);
   const botName = botTitles[profileSlug] || profileSlug;
-  const sessionCost = estimateSessionCost(merged, modelName);
+  const activeRouteHint =
+    rawModel && typeof rawModel === 'object' ? rawModel : profileRouteHint;
+  const sessionCost = estimateSessionCost(merged, modelName, liveUsage, rpcUsage, persistedSession, activeRouteHint);
 
   const isMultiSessionScope = prefs.usageScope !== 'session';
   const scopeLabel = buildScopeLabel(prefs, botName, profileNames.length, t);
   const scopedAgg = isMultiSessionScope
-    ? aggregatePersistedSessions(scopedSessions, prefs.timeRange, candidateIds, merged, modelName)
+    ? aggregatePersistedSessions(
+        scopedSessions,
+        prefs.timeRange,
+        candidateIds,
+        merged,
+        modelName,
+        Date.now(),
+        liveUsage,
+        rpcUsage,
+        persistedSession,
+        activeRouteHint
+      )
     : null;
 
   const displayInput = isMultiSessionScope ? scopedAgg.input : merged.input;
