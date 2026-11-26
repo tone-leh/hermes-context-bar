@@ -1,0 +1,12 @@
+name: hermes-context-bar
+label: Context Bar
+version: 1.0.0
+author: tone-leh
+homepage: https://github.com/tone-leh/hermes-context-bar
+description: >
+  Always-on context runway, live token generation speed (tok/s), Claude Code
+  /context-style category breakdown, customizable status bar, multi-bot and
+  multi-currency spend tracking, and in-place auto-compaction and memory budget
+  controls for Hermes Desktop. Desktop-only (desktop/plugin.js); zero extra LLM
+  tokens, zero external network calls, and zero credential access.
+tags: [desktop, context, usage, statusbar, compression]
