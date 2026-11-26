@@ -89,6 +89,7 @@ curl -fsSL https://raw.githubusercontent.com/tone-leh/hermes-context-bar/main/de
 ## 环境要求
 
 - **Hermes Desktop** `v0.21+`（已在 `v0.23.4` 本地与 Tailscale 远程网关下实测通过）。
+- **本地单测**（零依赖，Node 20+）：`node --import ./test/register.mjs --test test/*.test.mjs`
 
 ---
 

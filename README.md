@@ -89,6 +89,7 @@ Press `⌘ + R` (macOS) or `Ctrl + R` (Windows/Linux) in Hermes Desktop to load 
 ## Requirements
 
 - **Hermes Desktop** `v0.21+` (tested on `v0.23.4`, local and remote Tailscale gateways).
+- **Local tests** *(zero dependencies, Node 20+)*: `node --import ./test/register.mjs --test test/*.test.mjs`
 
 ---
 
