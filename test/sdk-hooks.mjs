@@ -51,6 +51,8 @@ export function PopoverContent(props) {
 export const host = {
   request: async () => null,
   requestProfile: async () => null,
+  navigate: () => {},
+  profileRoutes: () => [],
 };
 
 export function useValue(store) {
@@ -78,9 +80,11 @@ export const __test = {
   sanitizePrefs,
   loadPrefs,
   savePrefs,
-  buildApiScope,
   extractContextPolicy,
-  readSchemaChoices,
+  buildConfigGetParams,
+  mergeSdkConfigResponses,
+  readPolicyViaSdk,
+  ConfigPanel,
   toNum,
   toEpochMs,
   getTimeRangeCutoffMs,

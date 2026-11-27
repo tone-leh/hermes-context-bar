@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { describe, it } from 'node:test';
-import { STATUSBAR_AREAS, __setCompactNumber } from '@hermes/plugin-sdk';
+import { STATUSBAR_AREAS, __setCompactNumber, host } from '@hermes/plugin-sdk';
 import plugin, { __test } from '../desktop/plugin.js';
 
 const {
@@ -12,9 +13,11 @@ const {
   sanitizePrefs,
   loadPrefs,
   savePrefs,
-  buildApiScope,
   extractContextPolicy,
-  readSchemaChoices,
+  buildConfigGetParams,
+  mergeSdkConfigResponses,
+  readPolicyViaSdk,
+  ConfigPanel,
   toNum,
   toEpochMs,
   getTimeRangeCutoffMs,
@@ -714,18 +717,187 @@ describe('preferences, language & policy helpers', () => {
     });
   });
 
-  it('readSchemaChoices and buildApiScope handle valid and edge inputs', () => {
-    assert.deepEqual(readSchemaChoices({ fields: { k: { enum: ['a', '', 'b'] } } }, 'k'), ['a', 'b']);
-    assert.deepEqual(readSchemaChoices({ fields: { k: { choices: [1, 2] } } }, 'k'), ['1', '2']);
-    assert.deepEqual(readSchemaChoices({ fields: { k: { options: ['x'] } } }, 'k'), ['x']);
-    assert.deepEqual(readSchemaChoices(null, 'k'), []);
+  it('buildConfigGetParams and readPolicyViaSdk read config strictly via SDK RPC with safe fallbacks', async () => {
+    assert.deepEqual(buildConfigGetParams(null, 'default', 'full'), { key: 'full' });
+    assert.deepEqual(buildConfigGetParams(null, 'coder', 'full'), { key: 'full', profile: 'coder' });
+    assert.deepEqual(
+      buildConfigGetParams({ connectionId: 'local', profile: 'coder', targetProfile: 'coder' }, 'coder', 'full'),
+      { key: 'full' }
+    );
 
-    assert.deepEqual(buildApiScope('', ''), { priority: 'foreground' });
-    assert.deepEqual(buildApiScope('remote-1', 'coder'), {
-      priority: 'foreground',
-      connectionId: 'remote-1',
-      profile: 'coder',
+    // 1) When config.get(full) includes compression/memory, no fallback section calls are needed
+    const fullCalls = [];
+    const fullResult = await readPolicyViaSdk(
+      { connectionId: 'local', mode: 'local', profile: 'forge', targetProfile: 'forge' },
+      'forge',
+      async (_route, method, params) => {
+        fullCalls.push({ method, params });
+        if (params.key === 'full') {
+          return {
+            config: {
+              compression: { enabled: true, threshold: 0.65, target_ratio: 0.25, protect_last_n: 12 },
+              context: { engine: 'compressor' },
+              memory: { memory_enabled: true, user_profile_enabled: false, memory_char_limit: 4000 },
+              model: { provider: 'openrouter', base_url: 'https://openrouter.ai/api/v1' },
+            },
+          };
+        }
+        if (params.key === 'provider') {
+          return { provider: 'anthropic' };
+        }
+        throw new Error(`unexpected key: ${params.key}`);
+      }
+    );
+    assert.equal(fullCalls.length, 2);
+    assert.deepEqual(fullResult.policy, {
+      enabled: true,
+      threshold: 0.65,
+      targetRatio: 0.25,
+      protectLastN: 12,
+      contextEngine: 'compressor',
+      memoryEnabled: true,
+      userProfileEnabled: false,
+      memoryCharLimit: 4000,
+      userCharLimit: null,
     });
+    assert.deepEqual(fullResult.routeHint, {
+      provider: 'anthropic',
+      base_url: 'https://openrouter.ai/api/v1',
+    });
+
+    // 2) When config.get(full) only returns display.* and unknown keys reject, readPolicyViaSdk recovers cleanly
+    const partialResult = await readPolicyViaSdk(null, 'coder', async (_route, _method, params) => {
+      if (params.key === 'full') return { config: { display: { compact: false } } };
+      if (params.key === 'provider') return { provider: 'openai-codex' };
+      if (params.key === 'compression.threshold') return { key: 'compression.threshold', value: 0.75 };
+      if (params.key === 'compression.enabled') return { key: 'compression.enabled', value: 'on' };
+      throw new Error(`unknown config key: ${params.key}`);
+    });
+    assert.equal(partialResult.policy.enabled, true);
+    assert.equal(partialResult.policy.threshold, 0.75);
+    assert.equal(partialResult.policy.memoryEnabled, true);
+    assert.deepEqual(partialResult.routeHint, { provider: 'openai-codex', base_url: '' });
+
+    // 3) mergeSdkConfigResponses handles null/empty payloads safely
+    const emptyMerged = mergeSdkConfigResponses(null, null, {});
+    assert.equal(emptyMerged.policy.enabled, true);
+    assert.equal(emptyMerged.policy.threshold, null);
+    assert.deepEqual(emptyMerged.routeHint, { provider: '', base_url: '' });
+  });
+
+  it('ConfigPanel Policy tab renders strictly read-only overview and Open Settings action without raw bridge', () => {
+    const pluginSource = readFileSync(new URL('../desktop/plugin.js', import.meta.url), 'utf8');
+    assert.equal(pluginSource.includes('hermesDesktop'), false, 'desktop/plugin.js must not reference hermesDesktop');
+    assert.equal(pluginSource.includes('/api/config'), false, 'desktop/plugin.js must not call /api/config directly');
+
+    function collectNodes(node, pred, acc = []) {
+      if (!node || typeof node !== 'object') return acc;
+      if (Array.isArray(node)) {
+        for (const item of node) collectNodes(item, pred, acc);
+        return acc;
+      }
+      if (pred(node)) acc.push(node);
+      if (Array.isArray(node.children)) {
+        for (const child of node.children) collectNodes(child, pred, acc);
+      }
+      return acc;
+    }
+
+    function collectText(node) {
+      if (node == null || typeof node === 'boolean') return '';
+      if (typeof node === 'string' || typeof node === 'number') return String(node);
+      if (Array.isArray(node)) return node.map(collectText).join(' ');
+      if (typeof node === 'object' && Array.isArray(node.children)) {
+        return node.children.map(collectText).join(' ');
+      }
+      return '';
+    }
+
+    const actions = [];
+    let closedCount = 0;
+    const tree = ConfigPanel({
+      ctx: {
+        runAction(id) {
+          actions.push(id);
+          return { ok: true };
+        },
+      },
+      t: I18N.en,
+      prefs: DEFAULT_PREFS,
+      onPatch: () => {},
+      onReset: () => {},
+      onBack: () => {},
+      onClose: () => {
+        closedCount += 1;
+      },
+      botName: 'Forge',
+      profileCount: 2,
+      initialTab: 'policy',
+      policy: {
+        enabled: true,
+        threshold: 0.65,
+        targetRatio: null,
+        protectLastN: 16,
+        contextEngine: 'compressor',
+        memoryEnabled: true,
+        userProfileEnabled: true,
+        memoryCharLimit: null,
+        userCharLimit: 1800,
+      },
+    });
+
+    const text = collectText(tree);
+    assert.match(text, /Read-only/);
+    assert.match(text, /65%/);
+    assert.match(text, /20% \(default\)/);
+    assert.match(text, /16 msgs/);
+    assert.match(text, /2,200 chars \(default\)/);
+    assert.match(text, /Open Settings/);
+
+    // Policy tab must not render interactive form inputs or toggle switches
+    const inputs = collectNodes(tree, (n) => n.type === 'input');
+    const switches = collectNodes(tree, (n) => n.props?.role === 'switch');
+    assert.equal(inputs.length, 0);
+    assert.equal(switches.length, 0);
+
+    // Open Settings CTA triggers SDK nav.settings action and closes popover
+    const ctaButtons = collectNodes(tree, (n) => n.type === 'button' && n.props?.className === 'lub-settings-cta');
+    assert.equal(ctaButtons.length, 1);
+    ctaButtons[0].props.onClick();
+    assert.deepEqual(actions, ['nav.settings']);
+    assert.equal(closedCount, 1);
+
+    // Fallback to host.navigate('/settings') when ctx.runAction is absent
+    const navPaths = [];
+    const prevNavigate = host.navigate;
+    try {
+      host.navigate = (p) => navPaths.push(p);
+      const zhTree = ConfigPanel({
+        ctx: {},
+        t: I18N.zh,
+        prefs: DEFAULT_PREFS,
+        onPatch: () => {},
+        onReset: () => {},
+        onBack: () => {},
+        onClose: () => {
+          closedCount += 1;
+        },
+        botName: '工程师',
+        profileCount: 1,
+        initialTab: 'policy',
+        policy: extractContextPolicy(null),
+      });
+      const zhText = collectText(zhTree);
+      assert.match(zhText, /只读/);
+      assert.match(zhText, /打开官方设置页/);
+      const zhCta = collectNodes(zhTree, (n) => n.type === 'button' && n.props?.className === 'lub-settings-cta');
+      assert.equal(zhCta.length, 1);
+      zhCta[0].props.onClick();
+      assert.deepEqual(navPaths, ['/settings']);
+      assert.equal(closedCount, 2);
+    } finally {
+      host.navigate = prevNavigate;
+    }
   });
 });
 

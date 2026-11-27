@@ -161,12 +161,15 @@ const I18N = {
     persistentMemory: '持久记忆',
     userProfile: '用户画像',
     memoryCharLimit: '记忆字符上限',
-    syncTarget: (bot) => `同步写入 ${bot} 配置`,
-    openFullSettings: '完整设置 ↗',
-    saving: '保存中…',
-    saved: '已保存',
-    saveFailed: '保存失败',
-    writeUnsupported: '当前环境不支持写入配置',
+    userCharLimit: '画像字符上限',
+    readOnlyBadge: '只读',
+    stateOn: '已开启',
+    stateOff: '已关闭',
+    defaultVal: (v) => `${v}（默认）`,
+    charsUnit: (n) => `${Math.round(n).toLocaleString('en-US')} 字符`,
+    policyReadOnlyHint: '当前通过官方 SDK 只读展示策略参数；如需修改请前往官方设置页。',
+    syncTarget: (bot) => `当前角色：${bot}`,
+    openFullSettings: '打开官方设置页 ↗',
     presets: '预设',
     presetMinimal: '精简',
     presetBalanced: '均衡',
@@ -210,7 +213,7 @@ const I18N = {
     barTooltip: (u, w) => `占已用 ${u} / 占窗口 ${w}`,
     costTipFx: (r, c) => `1 USD = ${r} ${c}（点击切换货币）`,
     costTipSwitch: '点击切换货币',
-    policyTip: '修改自动压缩策略',
+    policyTip: '查看自动压缩与记忆策略',
     scopeTip: '切换统计口径',
     triggerAria: '上下文与用量',
     cat: {
@@ -280,7 +283,7 @@ const I18N = {
     tabScope: 'Scope',
     tabStyle: 'Style',
     autoCompaction: (bot) => `Auto-Compaction (${bot})`,
-    enableAutoCompact: 'Enable auto-compact',
+    enableAutoCompact: 'Auto-compact',
     triggerThreshold: 'Trigger threshold',
     targetRatio: 'Target summary ratio',
     protectRecent: 'Protect recent turns',
@@ -289,12 +292,15 @@ const I18N = {
     persistentMemory: 'Persistent memory',
     userProfile: 'User profile',
     memoryCharLimit: 'Memory char limit',
+    userCharLimit: 'Profile char limit',
+    readOnlyBadge: 'Read-only',
+    stateOn: 'Enabled',
+    stateOff: 'Disabled',
+    defaultVal: (v) => `${v} (default)`,
+    charsUnit: (n) => `${Math.round(n).toLocaleString('en-US')} chars`,
+    policyReadOnlyHint: 'Read-only overview via the official SDK. Open Settings to modify policy keys.',
     syncTarget: (bot) => `Profile: ${bot}`,
-    openFullSettings: 'Full Settings ↗',
-    saving: 'Saving…',
-    saved: 'Saved',
-    saveFailed: 'Save failed',
-    writeUnsupported: 'Config write unavailable here',
+    openFullSettings: 'Open Settings ↗',
     presets: 'Presets',
     presetMinimal: 'Minimal',
     presetBalanced: 'Balanced',
@@ -338,7 +344,7 @@ const I18N = {
     barTooltip: (u, w) => `${u} of used / ${w} of window`,
     costTipFx: (r, c) => `1 USD = ${r} ${c} (click to configure)`,
     costTipSwitch: 'Click to switch currency',
-    policyTip: 'Configure auto-compaction',
+    policyTip: 'View context & memory policy',
     scopeTip: 'Change spend scope',
     triggerAria: 'Context and usage controls',
     cat: {
@@ -1107,31 +1113,6 @@ const STYLES = `
   gap: 8px;
   padding: 3px 2px;
 }
-.lub-stepper {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-}
-.lub-step-btn {
-  width: 22px;
-  height: 22px;
-  border-radius: 5px;
-  border: 1px solid var(--ui-stroke-tertiary, rgba(128, 128, 128, 0.25));
-  background: transparent;
-  color: var(--foreground, inherit);
-  font-size: 12px;
-  line-height: 1;
-  cursor: pointer;
-}
-.lub-step-btn:hover:not(:disabled) { background: var(--chrome-action-hover, rgba(128, 128, 128, 0.10)); }
-.lub-step-btn:disabled { opacity: 0.35; cursor: not-allowed; }
-.lub-step-val {
-  min-width: 48px;
-  text-align: center;
-  font-size: 11.5px;
-  font-weight: 500;
-  color: var(--foreground, inherit);
-}
 .lub-num-input {
   width: 72px;
   padding: 3px 7px;
@@ -1147,15 +1128,73 @@ const STYLES = `
   outline: 1.5px solid var(--lub-accent-border);
   border-color: transparent;
 }
-.lub-cfg-foot {
-  display: flex;
+.lub-readonly-pill {
+  display: inline-flex;
   align-items: center;
+  padding: 1px 6px;
+  border-radius: 9999px;
+  font-size: 10px;
+  font-weight: 500;
+  background: var(--ui-bg-secondary, rgba(128, 128, 128, 0.11));
+  color: var(--ui-text-tertiary, #888);
+}
+.lub-policy-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.lub-policy-row {
+  display: flex;
+  align-items: baseline;
   justify-content: space-between;
+  gap: 10px;
+  padding: 4px 2px;
+}
+.lub-policy-key {
+  font-size: 11.5px;
+  color: var(--ui-text-secondary, #666);
+}
+.lub-policy-val {
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--foreground, inherit);
+  text-align: right;
+}
+.lub-policy-val[data-muted="true"] {
+  font-weight: 400;
+  color: var(--ui-text-tertiary, #888);
+}
+.lub-policy-foot {
+  display: flex;
+  flex-direction: column;
   gap: 8px;
   padding-top: 10px;
   border-top: 1px solid var(--ui-stroke-tertiary, rgba(128, 128, 128, 0.12));
+}
+.lub-policy-note {
+  margin: 0;
   font-size: 11px;
+  line-height: 1.45;
   color: var(--ui-text-tertiary, #888);
+}
+.lub-settings-cta {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  padding: 6px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--lub-accent-border);
+  background: var(--lub-accent-soft);
+  color: var(--foreground, inherit);
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background-color 140ms ease, border-color 140ms ease;
+}
+.lub-settings-cta:hover {
+  background: var(--chrome-action-hover, rgba(128, 128, 128, 0.16));
+  border-color: var(--foreground, rgba(128, 128, 128, 0.65));
 }
 `;
 
@@ -1292,48 +1331,7 @@ function savePrefs(ctx, prefs) {
   } catch {}
 }
 
-// ---- Official Hermes Profile Config Helpers (/api/config & /api/config/schema) ----
-function desktopApiAvailable() {
-  return typeof globalThis.window !== 'undefined' && typeof globalThis.window.hermesDesktop?.api === 'function';
-}
-
-function buildApiScope(connectionId, profile) {
-  const scope = { priority: 'foreground' };
-  if (connectionId) scope.connectionId = connectionId;
-  if (profile) scope.profile = profile;
-  return scope;
-}
-
-async function readOfficialConfig(connectionId, profile) {
-  if (!desktopApiAvailable()) return null;
-  return globalThis.window.hermesDesktop.api({
-    ...buildApiScope(connectionId, profile),
-    path: '/api/config',
-  });
-}
-
-async function readOfficialConfigSchema(connectionId, profile) {
-  if (!desktopApiAvailable()) return null;
-  return globalThis.window.hermesDesktop.api({
-    ...buildApiScope(connectionId, profile),
-    path: '/api/config/schema',
-  });
-}
-
-async function writeOfficialConfigPatch(connectionId, profile, configPatch, fallbackErr) {
-  if (!desktopApiAvailable()) throw new Error(fallbackErr);
-  const res = await globalThis.window.hermesDesktop.api({
-    ...buildApiScope(connectionId, profile),
-    path: '/api/config',
-    method: 'PUT',
-    body: { config: configPatch },
-  });
-  if (res && res.ok === false) {
-    throw new Error(res.error || res.detail || fallbackErr);
-  }
-  return res;
-}
-
+// ---- Official Hermes SDK Config Helpers (read-only via host.request / host.requestProfile) ----
 function extractContextPolicy(cfg) {
   const comp = cfg?.compression && typeof cfg.compression === 'object' ? cfg.compression : {};
   const ctxSec = cfg?.context && typeof cfg.context === 'object' ? cfg.context : {};
@@ -1351,11 +1349,91 @@ function extractContextPolicy(cfg) {
   };
 }
 
-function readSchemaChoices(schema, key) {
-  const f = schema?.fields?.[key];
-  if (!f || typeof f !== 'object') return [];
-  const raw = f.enum || f.choices || f.options;
-  return Array.isArray(raw) ? raw.map((x) => String(x)).filter(Boolean) : [];
+function buildConfigGetParams(route, profileSlug, key) {
+  const params = { key };
+  const prof = String(profileSlug || '').trim();
+  if (!route && prof && prof !== 'default') {
+    params.profile = prof;
+  }
+  return params;
+}
+
+function unwrapConfigValue(res) {
+  if (!res || typeof res !== 'object') return undefined;
+  return res.value !== undefined ? res.value : res;
+}
+
+function mergeSdkConfigResponses(fullRes, providerRes, sectionRes = {}) {
+  const baseCfg = fullRes?.config && typeof fullRes.config === 'object' ? fullRes.config : {};
+  const compBase = baseCfg.compression && typeof baseCfg.compression === 'object' ? baseCfg.compression : {};
+  const ctxBase = baseCfg.context && typeof baseCfg.context === 'object' ? baseCfg.context : {};
+  const memBase = baseCfg.memory && typeof baseCfg.memory === 'object' ? baseCfg.memory : {};
+  const modelBase = baseCfg.model && typeof baseCfg.model === 'object' ? baseCfg.model : {};
+
+  const compExtraRaw = unwrapConfigValue(sectionRes.compression);
+  const compExtra =
+    compExtraRaw && typeof compExtraRaw === 'object' && !Array.isArray(compExtraRaw) ? compExtraRaw : {};
+  const ctxExtraRaw = unwrapConfigValue(sectionRes.context);
+  const ctxExtra =
+    ctxExtraRaw && typeof ctxExtraRaw === 'object' && !Array.isArray(ctxExtraRaw) ? ctxExtraRaw : {};
+  const memExtraRaw = unwrapConfigValue(sectionRes.memory);
+  const memExtra =
+    memExtraRaw && typeof memExtraRaw === 'object' && !Array.isArray(memExtraRaw) ? memExtraRaw : {};
+
+  const compMerged = { ...compBase, ...compExtra };
+  const enVal = sectionRes.enabled?.value;
+  if (typeof enVal === 'boolean') {
+    compMerged.enabled = enVal;
+  } else if (typeof enVal === 'string' && ['true', 'false', 'on', 'off'].includes(enVal.toLowerCase())) {
+    compMerged.enabled = enVal.toLowerCase() === 'true' || enVal.toLowerCase() === 'on';
+  }
+  if (sectionRes.threshold?.value !== undefined && sectionRes.threshold.value !== null) {
+    compMerged.threshold = sectionRes.threshold.value;
+  }
+
+  const mergedCfg = {
+    ...baseCfg,
+    compression: compMerged,
+    context: { ...ctxBase, ...ctxExtra },
+    memory: { ...memBase, ...memExtra },
+  };
+
+  const provFromRpc = typeof providerRes?.provider === 'string' ? providerRes.provider : '';
+  const routeHint = {
+    provider: provFromRpc || (typeof modelBase.provider === 'string' ? modelBase.provider : ''),
+    base_url: typeof modelBase.base_url === 'string' ? modelBase.base_url : '',
+  };
+
+  return {
+    policy: extractContextPolicy(mergedCfg),
+    routeHint,
+  };
+}
+
+async function readPolicyViaSdk(route, profileSlug, callFn = gwCall) {
+  const mk = (key) => buildConfigGetParams(route, profileSlug, key);
+  const safeGet = (key) =>
+    Promise.resolve()
+      .then(() => callFn(route, 'config.get', mk(key)))
+      .catch(() => null);
+
+  const [fullRes, providerRes] = await Promise.all([safeGet('full'), safeGet('provider')]);
+  const fullCfg = fullRes?.config && typeof fullRes.config === 'object' ? fullRes.config : null;
+  const hasFullPolicy = Boolean(fullCfg && (fullCfg.compression || fullCfg.memory || fullCfg.context));
+
+  let sectionRes = {};
+  if (!hasFullPolicy) {
+    const [compression, enabled, threshold, memory, context] = await Promise.all([
+      safeGet('compression'),
+      safeGet('compression.enabled'),
+      safeGet('compression.threshold'),
+      safeGet('memory'),
+      safeGet('context'),
+    ]);
+    sectionRes = { compression, enabled, threshold, memory, context };
+  }
+
+  return mergeSdkConfigResponses(fullRes, providerRes, sectionRes);
 }
 
 // ---- Numeric, Time & Pricing Helpers ----
@@ -1774,15 +1852,33 @@ function normalizeCategories(breakdown, skin, t) {
 }
 
 function resolveRoute(owner, profileSlug) {
-  const connId = String(owner?.connectionId || '').trim();
   const profile = String(owner?.profile || profileSlug || 'default').trim() || 'default';
-  if (!connId) return null;
-  return {
-    connectionId: connId,
-    mode: connId === 'local' ? 'local' : 'remote',
-    profile,
-    targetProfile: profile,
-  };
+  const connId = String(owner?.connectionId || '').trim();
+  if (connId) {
+    return {
+      connectionId: connId,
+      mode: connId === 'local' ? 'local' : 'remote',
+      profile,
+      targetProfile: profile,
+    };
+  }
+  if (typeof host?.profileRoutes === 'function') {
+    try {
+      const routes = host.profileRoutes();
+      if (Array.isArray(routes)) {
+        const match = routes.find((r) => r?.profile === profile || r?.targetProfile === profile);
+        if (match && match.connectionId && match.profile && match.targetProfile) {
+          return {
+            connectionId: String(match.connectionId),
+            mode: match.mode || (match.connectionId === 'local' ? 'local' : 'remote'),
+            profile: String(match.profile),
+            targetProfile: String(match.targetProfile),
+          };
+        }
+      }
+    } catch {}
+  }
+  return null;
 }
 
 async function gwCall(route, method, params = {}) {
@@ -1856,21 +1952,15 @@ function ConfigPanel({
   onPatch,
   onReset,
   onBack,
+  onClose,
   botName,
   profileCount,
   initialTab,
   policy,
-  policySchema,
-  policyBusy,
-  policyNote,
-  onSavePolicy,
 }) {
   const [tab, setTab] = React.useState(initialTab || 'policy');
   const [fxDraft, setFxDraft] = React.useState(() =>
     String(prefs.fxRates?.[prefs.currency] ?? CURRENCY_META[prefs.currency]?.defaultRate ?? 1)
-  );
-  const [memLimitDraft, setMemLimitDraft] = React.useState(() =>
-    policy.memoryCharLimit != null ? String(policy.memoryCharLimit) : '2200'
   );
 
   React.useEffect(() => {
@@ -1883,10 +1973,6 @@ function ConfigPanel({
     );
   }, [prefs.currency, prefs.fxRates]);
 
-  React.useEffect(() => {
-    if (policy.memoryCharLimit != null) setMemLimitDraft(String(policy.memoryCharLimit));
-  }, [policy.memoryCharLimit]);
-
   const commitFx = () => {
     const n = Number(fxDraft);
     if (Number.isFinite(n) && n > 0) {
@@ -1898,35 +1984,21 @@ function ConfigPanel({
     }
   };
 
-  const commitMemLimit = () => {
-    const n = Math.round(Number(memLimitDraft));
-    if (Number.isFinite(n) && n >= 200 && n <= 50000) {
-      if (n !== policy.memoryCharLimit) onSavePolicy({ memory: { memory_char_limit: n } });
-    } else if (policy.memoryCharLimit != null) {
-      setMemLimitDraft(String(policy.memoryCharLimit));
-    }
-  };
-
-  const saveThreshold = (nextPct) => {
-    const clamped = Math.min(95, Math.max(25, nextPct));
-    const nextRatio = Number((clamped / 100).toFixed(2));
-    const compPatch = { threshold: nextRatio };
-    // Ensure target_ratio remains strictly below threshold
-    if (policy.targetRatio != null && policy.targetRatio >= nextRatio) {
-      compPatch.target_ratio = Number(Math.max(0.1, nextRatio - 0.1).toFixed(2));
-    }
-    onSavePolicy({ compression: compPatch });
-  };
-
   const openHermesSettings = () => {
     try {
       if (typeof ctx?.runAction === 'function') {
-        ctx.runAction('nav.settings');
-        return;
+        const res = ctx.runAction('nav.settings');
+        if (!res || res.ok !== false) {
+          if (typeof onClose === 'function') onClose();
+          return;
+        }
       }
     } catch {}
     try {
-      if (typeof globalThis.window !== 'undefined') globalThis.window.location.hash = '#/settings';
+      if (typeof host?.navigate === 'function') {
+        host.navigate('/settings');
+        if (typeof onClose === 'function') onClose();
+      }
     } catch {}
   };
 
@@ -1948,11 +2020,24 @@ function ConfigPanel({
   let body = [];
 
   if (tab === 'policy') {
-    const curThresholdPct = Math.round((policy.threshold ?? 0.5) * 100);
-    const curTargetPct = Math.round((policy.targetRatio ?? 0.2) * 100);
-    const curProtect = policy.protectLastN ?? 6;
-    const engineChoices = readSchemaChoices(policySchema, 'context.engine');
-    const canWrite = desktopApiAvailable();
+    const thresholdText =
+      policy.threshold != null ? `${Math.round(policy.threshold * 100)}%` : t.defaultVal('50%');
+    const targetText =
+      policy.targetRatio != null ? `${Math.round(policy.targetRatio * 100)}%` : t.defaultVal('20%');
+    const protectText =
+      policy.protectLastN != null ? t.msgsUnit(policy.protectLastN) : t.defaultVal(t.msgsUnit(20));
+    const memLimitText =
+      policy.memoryCharLimit != null
+        ? t.charsUnit(policy.memoryCharLimit)
+        : t.defaultVal(t.charsUnit(2200));
+
+    const policyRow = (key, label, value, muted = false) =>
+      h(
+        'div',
+        { key, className: 'lub-policy-row' },
+        h('span', { className: 'lub-policy-key' }, label),
+        h('span', { className: 'lub-policy-val', 'data-muted': String(Boolean(muted)) }, value)
+      );
 
     body = [
       h(
@@ -1962,196 +2047,60 @@ function ConfigPanel({
           'div',
           { className: 'lub-cfg-label-row' },
           h('span', { className: 'lub-cfg-label' }, t.autoCompaction(botName)),
-          policyNote
-            ? h('span', { className: 'lub-status-note', 'data-state': policyNote.err ? 'err' : 'ok' }, policyNote.text)
-            : null
+          h('span', { className: 'lub-readonly-pill' }, t.readOnlyBadge)
         ),
-        h(SwitchRow, {
-          checked: policy.enabled,
-          label: t.enableAutoCompact,
-          disabled: !canWrite || policyBusy,
-          onToggle: () => onSavePolicy({ compression: { enabled: !policy.enabled } }),
-        }),
-        policy.enabled
-          ? h(
-              'div',
-              { className: 'lub-inline-field' },
-              h('span', { className: 'lub-toggle-title' }, t.triggerThreshold),
-              h(
-                'div',
-                { className: 'lub-stepper' },
-                h(
-                  'button',
-                  {
-                    type: 'button',
-                    className: 'lub-step-btn',
-                    disabled: !canWrite || policyBusy || curThresholdPct <= 25,
-                    onClick: () => saveThreshold(curThresholdPct - 5),
-                  },
-                  '−'
-                ),
-                h('span', { className: 'lub-step-val' }, `${curThresholdPct}%`),
-                h(
-                  'button',
-                  {
-                    type: 'button',
-                    className: 'lub-step-btn',
-                    disabled: !canWrite || policyBusy || curThresholdPct >= 95,
-                    onClick: () => saveThreshold(curThresholdPct + 5),
-                  },
-                  '+'
-                )
-              )
-            )
-          : null,
-        policy.enabled
-          ? h(
-              'div',
-              { className: 'lub-seg-row' },
-              ...[50, 65, 75, 85].map((pct) =>
-                h(
-                  'button',
-                  {
-                    key: pct,
-                    type: 'button',
-                    className: 'lub-seg-btn',
-                    disabled: !canWrite || policyBusy,
-                    'data-active': String(curThresholdPct === pct),
-                    onClick: () => saveThreshold(pct),
-                  },
-                  `${pct}%`
-                )
-              )
-            )
-          : null,
-        policy.enabled
-          ? h(
-              'div',
-              { className: 'lub-inline-field' },
-              h('span', { className: 'lub-toggle-title' }, t.targetRatio),
-              h(
-                'div',
-                { className: 'lub-seg-row', style: { width: '150px' } },
-                ...[20, 30, 40].map((pct) =>
-                  h(
-                    'button',
-                    {
-                      key: pct,
-                      type: 'button',
-                      className: 'lub-seg-btn',
-                      style: { minWidth: '42px', padding: '3px 4px' },
-                      disabled: !canWrite || policyBusy || pct >= curThresholdPct,
-                      'data-active': String(curTargetPct === pct),
-                      onClick: () => onSavePolicy({ compression: { target_ratio: pct / 100 } }),
-                    },
-                    `${pct}%`
-                  )
-                )
-              )
-            )
-          : null,
-        policy.enabled
-          ? h(
-              'div',
-              { className: 'lub-inline-field' },
-              h('span', { className: 'lub-toggle-title' }, t.protectRecent),
-              h(
-                'div',
-                { className: 'lub-stepper' },
-                h(
-                  'button',
-                  {
-                    type: 'button',
-                    className: 'lub-step-btn',
-                    disabled: !canWrite || policyBusy || curProtect <= 2,
-                    onClick: () => onSavePolicy({ compression: { protect_last_n: Math.max(2, curProtect - 2) } }),
-                  },
-                  '−'
-                ),
-                h('span', { className: 'lub-step-val' }, t.msgsUnit(curProtect)),
-                h(
-                  'button',
-                  {
-                    type: 'button',
-                    className: 'lub-step-btn',
-                    disabled: !canWrite || policyBusy || curProtect >= 30,
-                    onClick: () => onSavePolicy({ compression: { protect_last_n: Math.min(30, curProtect + 2) } }),
-                  },
-                  '+'
-                )
-              )
-            )
-          : null,
-        engineChoices.length > 0
-          ? h(
-              'div',
-              { className: 'lub-cfg-group', style: { borderTop: 0, paddingTop: 2 } },
-              h('span', { className: 'lub-cfg-label' }, t.contextEngine),
-              h(
-                'div',
-                { className: 'lub-seg-row' },
-                ...engineChoices.map((eng) =>
-                  h(
-                    'button',
-                    {
-                      key: eng,
-                      type: 'button',
-                      className: 'lub-seg-btn',
-                      disabled: !canWrite || policyBusy,
-                      'data-active': String(policy.contextEngine === eng),
-                      onClick: () => onSavePolicy({ context: { engine: eng } }),
-                    },
-                    eng
-                  )
-                )
-              )
-            )
-          : null
+        h(
+          'div',
+          { className: 'lub-policy-list' },
+          policyRow('en', t.enableAutoCompact, policy.enabled ? t.stateOn : t.stateOff, !policy.enabled),
+          policy.enabled
+            ? policyRow('th', t.triggerThreshold, thresholdText, policy.threshold == null)
+            : null,
+          policy.enabled
+            ? policyRow('tr', t.targetRatio, targetText, policy.targetRatio == null)
+            : null,
+          policy.enabled
+            ? policyRow('pr', t.protectRecent, protectText, policy.protectLastN == null)
+            : null,
+          policy.contextEngine ? policyRow('eng', t.contextEngine, policy.contextEngine) : null
+        )
       ),
       h(
         'div',
         { key: 'mem-group', className: 'lub-cfg-group' },
         h('span', { className: 'lub-cfg-label' }, t.memoryBudget),
-        h(SwitchRow, {
-          checked: policy.memoryEnabled,
-          label: t.persistentMemory,
-          disabled: !canWrite || policyBusy,
-          onToggle: () => onSavePolicy({ memory: { memory_enabled: !policy.memoryEnabled } }),
-        }),
-        h(SwitchRow, {
-          checked: policy.userProfileEnabled,
-          label: t.userProfile,
-          disabled: !canWrite || policyBusy,
-          onToggle: () => onSavePolicy({ memory: { user_profile_enabled: !policy.userProfileEnabled } }),
-        }),
-        policy.memoryEnabled
-          ? h(
-              'div',
-              { className: 'lub-inline-field' },
-              h('span', { className: 'lub-toggle-title' }, t.memoryCharLimit),
-              h('input', {
-                type: 'number',
-                step: '200',
-                min: '200',
-                max: '50000',
-                disabled: !canWrite || policyBusy,
-                className: 'lub-num-input',
-                value: memLimitDraft,
-                'aria-label': t.memoryCharLimit,
-                onChange: (e) => setMemLimitDraft(e.target.value),
-                onBlur: commitMemLimit,
-                onKeyDown: (e) => {
-                  if (e.key === 'Enter') commitMemLimit();
-                },
-              })
-            )
-          : null
+        h(
+          'div',
+          { className: 'lub-policy-list' },
+          policyRow(
+            'mem-en',
+            t.persistentMemory,
+            policy.memoryEnabled ? t.stateOn : t.stateOff,
+            !policy.memoryEnabled
+          ),
+          policyRow(
+            'usr-en',
+            t.userProfile,
+            policy.userProfileEnabled ? t.stateOn : t.stateOff,
+            !policy.userProfileEnabled
+          ),
+          policy.memoryEnabled
+            ? policyRow('mem-lim', t.memoryCharLimit, memLimitText, policy.memoryCharLimit == null)
+            : null,
+          policy.userProfileEnabled && policy.userCharLimit != null
+            ? policyRow('usr-lim', t.userCharLimit, t.charsUnit(policy.userCharLimit))
+            : null
+        )
       ),
       h(
         'div',
-        { key: 'cfg-foot', className: 'lub-cfg-foot' },
-        h('span', null, t.syncTarget(botName)),
-        h('button', { type: 'button', className: 'lub-text-btn', onClick: openHermesSettings }, t.openFullSettings)
+        { key: 'cfg-foot', className: 'lub-policy-foot' },
+        h('p', { className: 'lub-policy-note' }, t.policyReadOnlyHint),
+        h(
+          'button',
+          { type: 'button', className: 'lub-settings-cta', onClick: openHermesSettings },
+          t.openFullSettings
+        )
       ),
     ];
   } else if (tab === 'metrics') {
@@ -2560,9 +2509,6 @@ function ContextBarChip({ ctx }) {
     memoryCharLimit: null,
     userCharLimit: null,
   });
-  const [policySchema, setPolicySchema] = React.useState(null);
-  const [policyBusy, setPolicyBusy] = React.useState(false);
-  const [policyNote, setPolicyNote] = React.useState(null);
   const [profileRouteHint, setProfileRouteHint] = React.useState(null);
 
   const [botTitles, setBotTitles] = React.useState({});
@@ -2573,7 +2519,6 @@ function ContextBarChip({ ctx }) {
   const [streamSpeed, setStreamSpeed] = React.useState({ tps: null, active: false });
 
   const closeTimerRef = React.useRef(null);
-  const noteTimerRef = React.useRef(null);
   const policyReqRef = React.useRef(0);
   const prevBusyRef = React.useRef(Boolean(busy));
   const streamRef = React.useRef({
@@ -2615,7 +2560,6 @@ function ContextBarChip({ ctx }) {
   React.useEffect(
     () => () => {
       cancelClose();
-      if (noteTimerRef.current !== null) globalThis.clearTimeout(noteTimerRef.current);
     },
     [cancelClose]
   );
@@ -2647,69 +2591,19 @@ function ContextBarChip({ ctx }) {
     };
   }, [ownerConnId, profileSlug]);
 
-  // 2. Load official Hermes context/compression/memory config + schema (race-guarded on bot switch)
+  // 2. Load official Hermes context/compression/memory config read-only via Plugin SDK (race-guarded on bot switch)
   const loadOfficialPolicy = React.useCallback(async () => {
     const reqId = ++policyReqRef.current;
     const route = resolveRoute({ connectionId: ownerConnId, profile: profileSlug }, profileSlug);
-    try {
-      const cfg = await readOfficialConfig(ownerConnId, profileSlug);
-      if (reqId !== policyReqRef.current) return;
-      if (cfg && typeof cfg === 'object') {
-        const inner = cfg.config && typeof cfg.config === 'object' ? cfg.config : cfg;
-        setPolicy(extractContextPolicy(inner));
-        const mSec = inner?.model && typeof inner.model === 'object' ? inner.model : {};
-        setProfileRouteHint({ provider: mSec.provider || '', base_url: mSec.base_url || '' });
-        return;
-      }
-    } catch {}
-    const [enRes, thRes, secRes] = await Promise.all([
-      gwCall(route, 'config.get', { key: 'compression.enabled' }).catch(() => null),
-      gwCall(route, 'config.get', { key: 'compression.threshold' }).catch(() => null),
-      gwCall(route, 'config.get', { key: 'compression' }).catch(() => null),
-    ]);
+    const result = await readPolicyViaSdk(route, profileSlug);
     if (reqId !== policyReqRef.current) return;
-    const sec = secRes?.value && typeof secRes.value === 'object' ? secRes.value : secRes;
-    const enabledRaw = enRes?.value !== undefined ? enRes.value : sec?.enabled !== undefined ? sec.enabled : true;
-    const thresholdRaw = thRes?.value !== undefined ? thRes.value : sec?.threshold ?? null;
-    setPolicy((prev) => ({
-      ...prev,
-      enabled: enabledRaw !== false,
-      threshold: normalizeThreshold(thresholdRaw),
-    }));
+    setPolicy(result.policy);
+    setProfileRouteHint(result.routeHint);
   }, [ownerConnId, profileSlug]);
 
   React.useEffect(() => {
-    let cancelled = false;
-    setPolicyNote(null);
     loadOfficialPolicy();
-    readOfficialConfigSchema(ownerConnId, profileSlug)
-      .then((schema) => {
-        if (!cancelled && schema && typeof schema === 'object') setPolicySchema(schema);
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
   }, [ownerConnId, profileSlug, loadOfficialPolicy, refreshNonce]);
-
-  const handleSavePolicy = React.useCallback(
-    async (configPatch) => {
-      setPolicyBusy(true);
-      setPolicyNote({ text: t.saving, err: false });
-      try {
-        await writeOfficialConfigPatch(ownerConnId, profileSlug, configPatch, t.writeUnsupported);
-        await loadOfficialPolicy();
-        setPolicyNote({ text: t.saved, err: false });
-        if (noteTimerRef.current !== null) globalThis.clearTimeout(noteTimerRef.current);
-        noteTimerRef.current = globalThis.setTimeout(() => setPolicyNote(null), 1800);
-      } catch (err) {
-        setPolicyNote({ text: err instanceof Error ? err.message : t.saveFailed, err: true });
-      } finally {
-        setPolicyBusy(false);
-      }
-    },
-    [ownerConnId, profileSlug, loadOfficialPolicy, t]
-  );
 
   // 3. Fetch focused session context_breakdown + usage + persisted backfill
   const candidateIdsKey = candidateIds.join('|');
@@ -3512,14 +3406,14 @@ function ContextBarChip({ ctx }) {
             onPatch: updatePrefs,
             onReset: resetPrefs,
             onBack: () => setView('overview'),
+            onClose: () => {
+              setPinned(false);
+              setOpen(false);
+            },
             botName,
             profileCount: profileNames.length,
             initialTab: configInitialTab,
             policy,
-            policySchema,
-            policyBusy,
-            policyNote,
-            onSavePolicy: handleSavePolicy,
           }),
         ]
       : overviewBody;
@@ -3565,7 +3459,7 @@ export default {
   id: 'hermes-context-bar',
   name: 'Context Bar',
   description:
-    'Always-on context runway, Claude Code /context-style breakdown, multi-bot & multi-currency spend tracking, and in-place compaction & memory policy controls for Hermes Desktop.',
+    'Always-on context runway, Claude Code /context-style breakdown, multi-bot & multi-currency spend tracking, one-click manual compaction, and read-only context & memory policy overview for Hermes Desktop.',
   defaultEnabled: true,
   register(ctx) {
     if (typeof document !== 'undefined') {

@@ -1,6 +1,6 @@
 # Context Bar for Hermes Desktop
 
-> Always-on context runway, Claude Code `/context`-style breakdown, multi-bot spend tracking, and in-place compaction controls — built natively for the Hermes Desktop status bar.
+> Always-on context runway, Claude Code `/context`-style breakdown, multi-bot spend tracking, one-click manual compaction, and read-only policy overview — built natively for the Hermes Desktop status bar.
 
 English | [简体中文](./README.zh-CN.md)
 
@@ -14,7 +14,7 @@ If you use Hermes Desktop daily across long sessions and multiple bot profiles, 
 
 1. **You fly blind until compaction hits.** You can't see how close a conversation is to Hermes's auto-compression threshold, or *what* actually filled the window — chat history, tool definitions, system prompts, subagents, rules, or long-term memory.
 2. **"Spend" is ambiguous.** A raw dollar figure without scope doesn't tell you whether you're looking at one session, one bot, or all your profiles combined — or whether that's today's cost or this month's, in USD or your local currency.
-3. **Context settings live far away from context usage.** Checking how full your window is happens in the chat; adjusting `compression.threshold`, `protect_last_n`, or memory budgets requires digging through Settings or editing `config.yaml`.
+3. **Context settings live far away from context usage.** Checking how full your window is happens in the chat, while inspecting active `compression.threshold`, `protect_last_n`, or memory budgets — and jumping to Settings when you want to tune them — usually means leaving your conversation flow.
 4. **Heavy dashboards break flow.** Full-page analytics tabs are great for weekly audits, not for glancing at your runway mid-conversation. And third-party widgets often clash visually with Hermes's quiet monochrome chrome.
 
 **Context Bar** puts the entire context & cost loop in one calm, native status-bar chip — zero app patches, zero extra LLM tokens, zero external network requests.
@@ -30,11 +30,11 @@ Hover or click the bottom-left status bar to see the live state of whichever bot
 - **Category breakdown**: sorted breakdown of `Conversation`, `Tools`, `Skills`, `System Prompt`, `Subagents`, `Rules`, `Memory`, `MCP`, plus `Available` and `Reserve`.
 - **One-click manual compression**: two-step confirm trigger calling Hermes's native `session.compress` when you want to trim early.
 
-### 2. In-Place Hermes Context & Memory Policy Control
-Right inside the **Policy** tab (or by clicking the threshold link on the main card), tune the active bot profile's native Hermes configuration directly — changes write via Hermes's `/api/config` and update your runway bar immediately:
-- **Auto-compression**: enable/disable (`compression.enabled`), threshold (`compression.threshold`, quick presets `50% / 65% / 75% / 85%` or ±5% steps), target ratio (`compression.target_ratio`), protected recent turns (`compression.protect_last_n`), and `context.engine` (dynamically populated from your gateway schema).
-- **Memory budget**: toggle persistent memory (`memory.memory_enabled`), user profile (`memory.user_profile_enabled`), and character limit (`memory.memory_char_limit`) — the exact knobs that affect memory's share of your context window.
-- **One-click escape hatch**: jump directly to Hermes's full Settings page whenever you need deeper options.
+### 2. Read-Only Context & Memory Policy Overview + Quick Settings Jump
+Right inside the **Policy** tab (or by clicking the threshold link on the main card), inspect the active bot profile's context and memory policy read-only via the official Desktop Plugin SDK (`config.get`), with a one-click jump to Hermes Settings whenever you want to edit:
+- **Auto-compression overview**: inspect active state (`compression.enabled`), trigger threshold (`compression.threshold`), target summary ratio (`compression.target_ratio`), protected recent turns (`compression.protect_last_n`), and `context.engine` (with clear fallback markers when defaults apply).
+- **Memory budget overview**: inspect persistent memory (`memory.memory_enabled`), profile memory state, and character limits (`memory.memory_char_limit` / `memory.user_char_limit`) that govern memory's share of your context window.
+- **One-click Open Settings**: Policy stays strictly read-only inside the plugin; click **Open Settings ↗** to jump directly to Hermes Desktop's official Settings page to modify configuration safely.
 
 ### 3. DIY Status Bar & Multi-Scope Consumption
 Right-click the status bar (or click the sliders icon) to configure every detail with live preview — persisted locally via `ctx.storage`:
@@ -57,7 +57,7 @@ Right-click the status bar (or click the sliders icon) to configure every detail
 ## Privacy & Architecture
 
 - **Desktop-only single file (`desktop/plugin.js`)**: no Python backend, no agent tools/hooks injected into prompts, **0 extra tokens consumed**.
-- **Zero external network requests**: all data comes from your own Hermes gateway (local or remote over Tailscale/LAN) via the official Desktop Plugin SDK and `/api/config`. Currency conversion runs strictly offline using your local rate table.
+- **Zero external network requests & pure SDK compliance**: all data comes from your own Hermes gateway (local or remote over Tailscale/LAN) strictly via the official `@hermes/plugin-sdk` (`host.state`, `host.request`, `host.requestProfile`, `ctx.storage`) — no raw Electron bridge calls. Currency conversion runs strictly offline using your local rate table.
 - **Zero credential access**: never reads `.env`, API keys, or OAuth tokens.
 - **Zero core patches**: loads cleanly through Hermes Desktop's native plugin directory and survives app upgrades untouched.
 
