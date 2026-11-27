@@ -115,6 +115,7 @@ export const __test = {
   gwCall,
   synthesizeCanonicalSessionRow,
   fetchBackendLedger,
+  extractFocusedSessionFromLedger,
   discoverConnectionRoster,
   collectProfileSessionsForScope,
   resolveToneLevel,

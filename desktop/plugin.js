@@ -377,20 +377,15 @@ const MONO_OPACITIES = [0.85, 0.56, 0.40, 0.30, 0.22, 0.16, 0.12];
 const PRISM_FALLBACK_COLORS = ['#7c3aed', '#5b73d6', '#4c93ad', '#7b8498', '#9c71b5', '#53947c'];
 
 // Scheduled Google official API rate transitions (UTC):
-// - Gemini 4 Carbon / Argon intro ($2/$10/$0.10) through 2026-11-30; standard ($4/$20/$0.20) from 2026-12-01.
 // - Gemini 3.8 / 3.7 Flash promo ($0.75/$3.75/$0.075) through 2026-12-31; standard ($1.50/$7.50/$0.15) from 2027-01-01.
-const GEMINI_4_CARBON_STD_AT_MS = Date.UTC(2026, 11, 1, 0, 0, 0);
 const GEMINI_38_FLASH_STD_AT_MS = Date.UTC(2027, 0, 1, 0, 0, 0);
 
 // Per-1M USD fallback rates: [input, output, cacheRead, optionalTierRule]
-// Aligned with Google AI / Cloud Billing official pricing (https://ai.google.dev/gemini-api/docs/pricing)
-// and Hermes v0.23.4 agent/usage_pricing.py official snapshots.
+// Aligned with verified Google Cloud Billing SKU charges and Hermes v0.23.4 agent/usage_pricing.py.
 const MODEL_PRICING = [
   // --- Google Gemini 4 Official API ---
-  [
-    /gemini[-./]*4[-.]*(carbon|argon)/i,
-    [2.0, 10.0, 0.1, { effectiveAtMs: GEMINI_4_CARBON_STD_AT_MS, nextRates: [4.0, 20.0, 0.2] }],
-  ],
+  // Verified against live Google Cloud Billing SKUs: Carbon bills at $4.00 in / $20.00 out / $0.20 cache read.
+  [/gemini[-./]*4[-.]*(carbon|argon)/i, [4.0, 20.0, 0.2]],
   [/gemini[-./]*4[-.]*neon/i, [3.0, 15.0, 0.15]],
   [/gemini[-./]*4[-.]*hydrogen/i, [1.5, 7.5, 0.075]],
   // --- Google Gemini 3.x Official API ---
@@ -2496,6 +2491,73 @@ async function fetchBackendLedger(ctx) {
   }
 }
 
+function extractFocusedSessionFromLedger(entries, candidateIds, profileSlug) {
+  if (!Array.isArray(entries) || !Array.isArray(candidateIds) || candidateIds.length === 0) return null;
+  const idSet = new Set(candidateIds.filter(Boolean));
+  const prof = String(profileSlug || 'default').trim() || 'default';
+  const profEntries = entries.filter(
+    (e) => e && typeof e === 'object' && !e._is_aux && String(e._profile || e.profile || 'default').trim() === prof
+  );
+  const byId = new Map();
+  for (const e of profEntries) {
+    const eid = String(e.id || e.session_id || '').trim();
+    if (eid) byId.set(eid, e);
+  }
+  let tip = null;
+  for (const cid of idSet) {
+    if (byId.has(cid)) {
+      tip = byId.get(cid);
+      break;
+    }
+  }
+  if (!tip) return null;
+
+  let input = toNum(tip.input_tokens) ?? 0;
+  let cacheRead = toNum(tip.cache_read_tokens) ?? 0;
+  let cacheWrite = toNum(tip.cache_write_tokens) ?? 0;
+  let output = toNum(tip.output_tokens) ?? 0;
+  let reasoning = toNum(tip.reasoning_tokens) ?? 0;
+  let calls = toNum(tip.api_call_count) ?? 0;
+  let cost = pickBestNum(tip.actual_cost_usd, tip.cost_usd, tip.estimated_cost_usd);
+  let hasCost = cost != null;
+  let totalCost = cost ?? 0;
+  let compressions = 0;
+
+  let curPid = String(tip.parent_session_id || '').trim();
+  const visited = new Set([String(tip.id || '')]);
+  while (curPid && !visited.has(curPid)) {
+    visited.add(curPid);
+    const anc = byId.get(curPid);
+    if (!anc) break;
+    if (anc.end_reason && String(anc.end_reason) !== 'compression') break;
+    compressions += 1;
+    input += toNum(anc.input_tokens) ?? 0;
+    cacheRead += toNum(anc.cache_read_tokens) ?? 0;
+    cacheWrite += toNum(anc.cache_write_tokens) ?? 0;
+    output += toNum(anc.output_tokens) ?? 0;
+    reasoning += toNum(anc.reasoning_tokens) ?? 0;
+    calls += toNum(anc.api_call_count) ?? 0;
+    const ancCost = pickBestNum(anc.actual_cost_usd, anc.cost_usd, anc.estimated_cost_usd);
+    if (ancCost != null) {
+      totalCost += ancCost;
+      hasCost = true;
+    }
+    curPid = String(anc.parent_session_id || '').trim();
+  }
+
+  return {
+    ...tip,
+    input_tokens: input,
+    cache_read_tokens: cacheRead,
+    cache_write_tokens: cacheWrite,
+    output_tokens: output,
+    reasoning_tokens: reasoning,
+    api_call_count: calls,
+    ...(compressions > 0 ? { compression_count: compressions } : {}),
+    ...(hasCost ? { estimated_cost_usd: totalCost } : {}),
+  };
+}
+
 async function discoverConnectionRoster({
   effectiveConnId = '',
   routeMap = null,
@@ -3718,7 +3780,31 @@ function ContextBarChip({ ctx }) {
         if (gotBreakdown && gotUsage) break;
       }
 
-      const gotPersisted = await persistedPromise;
+      let gotPersisted = await persistedPromise;
+      const persistedHasTokens =
+        gotPersisted &&
+        ((toNum(gotPersisted.input_tokens) ?? 0) > 0 ||
+          (toNum(gotPersisted.cache_read_tokens) ?? 0) > 0 ||
+          (toNum(gotPersisted.output_tokens) ?? 0) > 0);
+      // In standalone dashboard mode, hidden Bot Chats are excluded from `listPersistedSessions` and `session.usage`
+      // returns 4001 on cold reload. Backfill the focused session directly from `/ledger` so Session scope shows immediately!
+      if (!persistedHasTokens && isWindowPrimaryConn) {
+        const cached = ledgerApiCacheRef.current.get(connScopeKey);
+        let entries = cached && Date.now() - cached.fetchedAt < 2500 ? cached.entries : null;
+        if (!entries) {
+          const fresh = await fetchBackendLedger(ctx);
+          if (fresh) {
+            ledgerApiCacheRef.current.set(connScopeKey, { fetchedAt: Date.now(), entries: fresh.entries });
+            entries = fresh.entries;
+          }
+        }
+        if (entries) {
+          const fromLedger = extractFocusedSessionFromLedger(entries, ids, profileSlug);
+          if (fromLedger) {
+            gotPersisted = fromLedger;
+          }
+        }
+      }
       if (cancelled) return;
       if (gotBreakdown) setBreakdown({ ...gotBreakdown, _sid: sessionId });
       if (gotUsage) setRpcUsage({ ...gotUsage, _sid: sessionId });
@@ -3742,7 +3828,7 @@ function ContextBarChip({ ctx }) {
       cancelled = true;
       if (retryTimer !== null) globalThis.clearTimeout(retryTimer);
     };
-  }, [sessionId, candidateIdsKey, effectiveConnId, profileSlug, routeMap, refreshNonce]);
+  }, [ctx, sessionId, candidateIdsKey, effectiveConnId, connScopeKey, isWindowPrimaryConn, profileSlug, routeMap, refreshNonce]);
 
   // 4. Fetch multi-session / multi-profile spend ledger:
   // Primary engine: authoritative read-only SQLite `/ledger` via official `ctx.rest('/ledger')`.

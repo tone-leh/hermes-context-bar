@@ -48,6 +48,7 @@ const {
   gwCall,
   synthesizeCanonicalSessionRow,
   fetchBackendLedger,
+  extractFocusedSessionFromLedger,
   discoverConnectionRoster,
   collectProfileSessionsForScope,
   resolveToneLevel,
@@ -333,9 +334,9 @@ describe('estimateRawTokensUsd & estimateSessionCost', () => {
     const dec2026 = Date.UTC(2026, 11, 1, 0, 0, 0);
     const jan2027 = Date.UTC(2027, 0, 2, 0, 0, 0);
 
-    // Gemini 4 Carbon: $2/$10/$0.10 intro through Nov 30, 2026; $4/$20/$0.20 from Dec 1, 2026
+    // Gemini 4 Carbon: verified live Google Cloud Billing SKU rate ($4/$20/$0.20)
     // Note: `input` is ALREADY uncached fresh input; `cacheRead` is billed IN ADDITION to `input`!
-    approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'gemini-4-carbon', null, null, 0, null, nov2026), 12.0);
+    approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'gemini-4-carbon', null, null, 0, null, nov2026), 24.0);
     approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'gemini-4-carbon', 500_000, null, 0, null, dec2026), 24.1);
     // Exact production verification against Hermes `agent/usage_pricing.py` (gemini-4-neon $3/$15/$0.15):
     // 4,013,090 fresh in ($12.03927) + 15,818,143 cache read ($2.37272145) + 139,445 out ($2.091675) = $16.50366645
@@ -657,8 +658,8 @@ describe('multi-bot roster discovery, hidden Bot Chat backfill & cross-bot All-s
     approxEqual(aggWhenDefaultFocused.costUsd, aggWhenForgeFocused.costUsd, 1e-6);
     assert.equal(aggWhenDefaultFocused.total, aggWhenScoutFocused.total);
     assert.equal(aggWhenDefaultFocused.sessionCount, 7);
-    // Expected total: 16.503666 + 0.389717 + 1.702362 + 0.583482 + 1.641824 + 0.3737 + 0.5751 ≈ $21.77
-    approxEqual(aggWhenDefaultFocused.costUsd, 21.76985, 1e-4);
+    // Expected total: 16.503666 + 0.389717 + 1.702362 + 1.166963 (Carbon $4/$20/$0.20) + 1.641824 + 0.3737 + 0.5751 ≈ $22.35
+    approxEqual(aggWhenDefaultFocused.costUsd, 22.35333, 1e-4);
   });
 
   it('tracks daily ledger baselines so cross-day forever Bot Chats report exact daily deltas after day rollover', () => {
@@ -1616,5 +1617,22 @@ describe('v1.0.2 auditor hardening & ledger API dual-engine suite', () => {
     const asyncCtx = { storage: { get: () => Promise.resolve({ showBar: false }) } };
     assert.equal(loadPrefs(asyncCtx).showBar, true);
     assert.deepEqual(loadUsageLedger(asyncCtx), {});
+
+    // Focused cold-reload session backfill from `/ledger` (including compressed ancestor chain summation)
+    const focusedChain = extractFocusedSessionFromLedger(
+      [
+        { id: 'S1', _profile: 'default', end_reason: 'compression', input_tokens: 1_000_000, cache_read_tokens: 2_000_000, output_tokens: 50_000, estimated_cost_usd: 4.05 },
+        { id: 'S2', _profile: 'default', parent_session_id: 'S1', input_tokens: 200_000, cache_read_tokens: 500_000, output_tokens: 10_000, estimated_cost_usd: 0.825 },
+        { id: 'aux:S2:vision:m:g', _profile: 'default', _is_aux: true, input_tokens: 999999, estimated_cost_usd: 99 },
+      ],
+      ['S2'],
+      'default'
+    );
+    assert.ok(focusedChain);
+    assert.equal(focusedChain.input_tokens, 1_200_000);
+    assert.equal(focusedChain.cache_read_tokens, 2_500_000);
+    assert.equal(focusedChain.output_tokens, 60_000);
+    assert.equal(focusedChain.compression_count, 1);
+    approxEqual(focusedChain.estimated_cost_usd, 4.875);
   });
 });
