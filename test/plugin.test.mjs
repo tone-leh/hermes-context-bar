@@ -32,12 +32,24 @@ const {
   pickBestNum,
   isPrivateOrLoopbackUrl,
   isZeroMarginalCostSource,
+  extractSourceTokenBuckets,
   estimateRawTokensUsd,
   mergeUsageSources,
   estimateSessionCost,
+  formatLocalDayKey,
+  loadUsageLedger,
+  saveUsageLedger,
+  lookupLedgerBaseline,
+  recordLedgerObservation,
   aggregatePersistedSessions,
   normalizeCategories,
   resolveRoute,
+  loadAsyncRouteMap,
+  gwCall,
+  synthesizeCanonicalSessionRow,
+  fetchBackendLedger,
+  discoverConnectionRoster,
+  collectProfileSessionsForScope,
   resolveToneLevel,
   buildScopeLabel,
 } = __test;
@@ -238,27 +250,47 @@ describe('mergeUsageSources', () => {
     ];
 
     for (const cacheObj of variants) {
-      const merged = mergeUsageSources({ input: 10000, ...cacheObj }, {}, {}, {});
+      // input=2000 (uncached fresh) + cacheRead=8000 -> promptTokens=10000 -> 80% cacheHitPct
+      const merged = mergeUsageSources({ input: 2000, ...cacheObj }, {}, {}, {});
+      assert.equal(merged.input, 2000);
       assert.equal(merged.cacheRead, 8000);
+      assert.equal(merged.promptTokens, 10000);
       assert.equal(merged.cacheHitPct, 80);
     }
 
-    // Also reads cache fields from rpcUsage and persistedSession
+    // Raw OpenAI shape with prompt_tokens + cached_input_tokens (no input_tokens): derives fresh input=15000
     const fromRpc = mergeUsageSources({}, { prompt_tokens: 20000, cached_input_tokens: 5000 }, {}, {});
+    assert.equal(fromRpc.input, 15000);
     assert.equal(fromRpc.cacheRead, 5000);
+    assert.equal(fromRpc.promptTokens, 20000);
     assert.equal(fromRpc.cacheHitPct, 25);
 
-    const fromPersisted = mergeUsageSources({}, {}, { input_tokens: 4000, cache_read_tokens: 3000 }, {});
-    assert.equal(fromPersisted.cacheRead, 3000);
+    // Persisted SQLite row: input_tokens=2000 (uncached) + cache_read_tokens=6000 -> promptTokens=8000 (75%)
+    const fromPersisted = mergeUsageSources({}, {}, { input_tokens: 2000, cache_read_tokens: 6000 }, {});
+    assert.equal(fromPersisted.input, 2000);
+    assert.equal(fromPersisted.cacheRead, 6000);
+    assert.equal(fromPersisted.promptTokens, 8000);
     assert.equal(fromPersisted.cacheHitPct, 75);
+
+    // tui_usage shape (liveUsage / session.info.usage): uncached `input` + total `prompt` without `cache_read_tokens`
+    const fromTuiUsage = mergeUsageSources(
+      { input: 4_013_090, prompt: 19_831_233, output: 139_445, cache_hit_pct: 80 },
+      {},
+      {},
+      {}
+    );
+    assert.equal(fromTuiUsage.input, 4_013_090);
+    assert.equal(fromTuiUsage.cacheRead, 15_818_143);
+    assert.equal(fromTuiUsage.promptTokens, 19_831_233);
+    assert.equal(fromTuiUsage.total, 19_831_233 + 139_445);
   });
 
   it('prefers positive direct cacheHitPct, falls back to derived when direct is 0, and caps at 100', () => {
-    const directWins = mergeUsageSources({ input: 10000, cache_read_tokens: 5000, cache_hit_pct: 62 }, {}, {}, {});
+    const directWins = mergeUsageSources({ input: 5000, cache_read_tokens: 5000, cache_hit_pct: 62 }, {}, {}, {});
     assert.equal(directWins.cacheHitPct, 62);
 
     const zeroFallsBackToDerived = mergeUsageSources(
-      { input: 10000, cache_read_tokens: 7500, cache_hit_pct: 0 },
+      { input: 2500, cache_read_tokens: 7500, cache_hit_pct: 0 },
       {},
       {},
       {}
@@ -268,14 +300,17 @@ describe('mergeUsageSources', () => {
     const zeroWithoutCacheRead = mergeUsageSources({ input: 10000, cache_hit_pct: 0 }, {}, {}, {});
     assert.equal(zeroWithoutCacheRead.cacheHitPct, 0);
 
-    const capped = mergeUsageSources({ input: 1000, cacheRead: 2500 }, {}, {}, {});
-    assert.equal(capped.cacheHitPct, 100);
+    const highHit = mergeUsageSources({ input: 0, cacheRead: 2500 }, {}, {}, {});
+    assert.equal(highHit.cacheHitPct, 100);
   });
 
   it('handles null, undefined, and non-object inputs gracefully', () => {
     const empty = mergeUsageSources(null, undefined, 'invalid', 42);
     assert.deepEqual(empty, {
       input: null,
+      cacheRead: null,
+      cacheWrite: null,
+      promptTokens: null,
       output: null,
       reasoning: null,
       total: null,
@@ -283,7 +318,6 @@ describe('mergeUsageSources', () => {
       ctxUsed: null,
       ctxMax: null,
       ctxPct: null,
-      cacheRead: null,
       cacheHitPct: null,
       compressions: null,
       avgTps: null,
@@ -300,8 +334,15 @@ describe('estimateRawTokensUsd & estimateSessionCost', () => {
     const jan2027 = Date.UTC(2027, 0, 2, 0, 0, 0);
 
     // Gemini 4 Carbon: $2/$10/$0.10 intro through Nov 30, 2026; $4/$20/$0.20 from Dec 1, 2026
+    // Note: `input` is ALREADY uncached fresh input; `cacheRead` is billed IN ADDITION to `input`!
     approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'gemini-4-carbon', null, null, 0, null, nov2026), 12.0);
-    approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'gemini-4-carbon', 500_000, null, 0, null, dec2026), 22.1);
+    approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'gemini-4-carbon', 500_000, null, 0, null, dec2026), 24.1);
+    // Exact production verification against Hermes `agent/usage_pricing.py` (gemini-4-neon $3/$15/$0.15):
+    // 4,013,090 fresh in ($12.03927) + 15,818,143 cache read ($2.37272145) + 139,445 out ($2.091675) = $16.50366645
+    approxEqual(
+      estimateRawTokensUsd(4_013_090, 139_445, 'gemini-4-neon', 15_818_143, null, 54_392, null, nov2026),
+      16.50366645
+    );
     // Gemini 4 Neon ($3/$15/$0.15) & Hydrogen ($1.5/$7.5/$0.075)
     approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'gemini-4-neon'), 18.0);
     approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'gemini-4-hydrogen'), 9.0);
@@ -390,15 +431,19 @@ describe('estimateRawTokensUsd & estimateSessionCost', () => {
     assert.equal(agg.estimated, false);
   });
 
-  it('applies cache discounts using cacheRead or cacheHitPct without negative fresh input', () => {
+  it('bills uncached input and cacheRead additively without double-subtracting cacheRead from input', () => {
     // Claude Sonnet: [3.0, 15.0, 0.3]
-    // 800k cached + 200k fresh + 200k out = 0.24 + 0.60 + 3.00 = 3.84
-    approxEqual(estimateRawTokensUsd(1_000_000, 200_000, 'claude-sonnet-4', 800_000), 3.84);
+    // 200k fresh uncached input + 800k cacheRead + 200k out = 0.60 + 0.24 + 3.00 = 3.84
+    approxEqual(estimateRawTokensUsd(200_000, 200_000, 'claude-sonnet-4', 800_000), 3.84);
 
-    // cacheRead exceeding input is clamped to input (no negative fresh tokens)
-    approxEqual(estimateRawTokensUsd(1_000_000, 200_000, 'claude-sonnet-4', 1_500_000), 3.3);
+    // When cacheRead exceeds fresh input (the typical high-cache-hit session!), fresh input MUST NOT be zeroed out:
+    // 1M fresh ($3.00) + 1.5M cacheRead ($0.45) + 200k out ($3.00) = $6.45
+    approxEqual(estimateRawTokensUsd(1_000_000, 200_000, 'claude-sonnet-4', 1_500_000), 6.45);
 
-    // cacheHitPct fallback when cacheRead is null
+    // Pure cacheRead (0 fresh input + 1M cacheRead + 0 out) still bills cacheRead accurately ($0.30)
+    approxEqual(estimateRawTokensUsd(0, 0, 'claude-sonnet-4', 1_000_000), 0.3);
+
+    // cacheHitPct fallback when explicit cacheRead is absent (splits combined input)
     approxEqual(estimateRawTokensUsd(1_000_000, 200_000, 'claude-sonnet-4', null, 50), 4.65);
 
     // cacheHitPct > 100 is clamped to 100%
@@ -436,16 +481,264 @@ describe('estimateRawTokensUsd & estimateSessionCost', () => {
     );
 
     const est = estimateSessionCost(
-      { backendCost: null, input: 1_000_000, output: 0, cacheRead: 500_000, cacheHitPct: null, reasoning: 0, total: 1_000_000 },
+      { backendCost: null, input: 1_000_000, output: 0, cacheRead: 500_000, cacheHitPct: null, reasoning: 0, total: 1_500_000 },
       'claude-sonnet-4'
     );
     assert.equal(est.estimated, true);
-    approxEqual(est.amount, 1.65);
+    // 1M fresh ($3.00) + 500k cacheRead ($0.15) = $3.15
+    approxEqual(est.amount, 3.15);
 
     assert.deepEqual(
       estimateSessionCost({ backendCost: null, input: 1000, output: 500 }, 'unknown-model'),
       { amount: null, estimated: true }
     );
+  });
+});
+
+describe('multi-bot roster discovery, hidden Bot Chat backfill & cross-bot All-scope invariance', () => {
+  it('resolves async host.profileRoutes and discovers full multi-bot roster even when secondary profiles are isolated', async () => {
+    const routeMap = await loadAsyncRouteMap('tailscale-lemini', {
+      profileRoutes: async () => [
+        { connectionId: 'tailscale-lemini', mode: 'remote', profile: 'default', targetProfile: 'default' },
+        { connectionId: 'tailscale-lemini', mode: 'remote', profile: 'scout', targetProfile: 'scout' },
+        { connectionId: 'other-conn', mode: 'remote', profile: 'ignored', targetProfile: 'ignored' },
+      ],
+    });
+    assert.deepEqual(Object.keys(routeMap).sort(), ['default', 'scout']);
+    assert.equal(resolveRoute(null, 'scout', routeMap).connectionId, 'tailscale-lemini');
+
+    // Simulate secondary profile `scout` returning only itself on `profiles.list`, while `default` returns all 4 bots
+    const gwCalls = [];
+    const roster = await discoverConnectionRoster({
+      effectiveConnId: 'tailscale-lemini',
+      routeMap,
+      gwCallFn: async (route, method, params, profileHint) => {
+        gwCalls.push({ profile: route?.profile || profileHint, method, params });
+        if ((route?.profile || profileHint) === 'default' && method === 'profiles.list') {
+          return {
+            profiles: [
+              { name: 'default', display_name: '总管', model: 'gemini-4-neon', provider: 'gemini', canonical_session: { id: 'bot-def', last_active: 1795758810 } },
+              { name: 'scout', display_name: '情报官', model: 'gemini-4-hydrogen', provider: 'gemini', canonical_session: { id: 'bot-sct', last_active: 1795759312 } },
+              { name: 'muse', display_name: '写作官', model: 'gemini-4-neon', provider: 'gemini', canonical_session: { id: 'bot-mus', last_active: 1795747401 } },
+              { name: 'forge', display_name: '工程师', model: 'gemini-4-carbon', provider: 'gemini', canonical_session: { id: 'bot-frg', last_active: 1795748039 } },
+            ],
+          };
+        }
+        return { profiles: [{ name: 'scout' }] };
+      },
+      hostObj: {
+        agents: async () => ({
+          agents: [
+            { connectionId: 'tailscale-lemini', profile: 'default', displayName: '总管' },
+            { connectionId: 'other-host', profile: 'intruder', displayName: 'Intruder' },
+          ],
+        }),
+      },
+    });
+
+    assert.deepEqual(roster.names, ['default', 'forge', 'muse', 'scout']);
+    assert.equal(roster.titles.scout, '情报官');
+    assert.equal(roster.canonicalByProfile.default.id, 'bot-def');
+    assert.equal(gwCalls[0].profile, 'default');
+  });
+
+  it('backfills hidden Bot Chats across all 4 bots and produces identical All-Bots spend regardless of which bot is focused', async () => {
+    const nowSec = 1795760000;
+    const nowMs = nowSec * 1000;
+    const canonicalByProfile = {
+      default: { id: 'bot-def', last_active: nowSec - 100, started_at: nowSec - 86400 * 2 },
+      scout: { id: 'bot-sct', last_active: nowSec - 200, started_at: nowSec - 86400 * 2 },
+      muse: { id: 'bot-mus', last_active: nowSec - 300, started_at: nowSec - 86400 * 2 },
+      forge: { id: 'bot-frg', last_active: nowSec - 400, started_at: nowSec - 86400 * 2 },
+    };
+
+    // Hidden Bot Chats are NOT in listPersistedSessions; only cron/subagent rows are
+    const persistedByProfile = {
+      default: [
+        { id: 'sub-5', source: 'subagent', last_active: nowSec - 500, input_tokens: 315_693, cache_read_tokens: 5_200_681, output_tokens: 49_037, estimated_cost_usd: 1.641824, model: 'gemini-4-carbon' },
+        { id: 'cron-d1', source: 'cron', last_active: nowSec - 600, input_tokens: 93_342, cache_read_tokens: 20_774, output_tokens: 6_038, estimated_cost_usd: 0.3737, model: 'gemini-4-neon' },
+      ],
+      scout: [
+        { id: 'cron-s1', source: 'cron', last_active: nowSec - 700, input_tokens: 242_072, cache_read_tokens: 436_277, output_tokens: 23_898, estimated_cost_usd: 0.5751, model: 'gemini-4-hydrogen' },
+      ],
+      muse: [],
+      forge: [],
+    };
+
+    const sessionInfoPayloads = {
+      'bot-def': {
+        model: 'gemini-4-neon',
+        provider: 'gemini',
+        started_at: nowSec - 86400 * 2,
+        last_active_at: nowSec - 100,
+        usage: { model: 'gemini-4-neon', input: 4_013_090, prompt: 19_831_233, output: 139_445, reasoning: 54_392 },
+      },
+      'bot-sct': {
+        model: 'gemini-4-hydrogen',
+        provider: 'gemini',
+        started_at: nowSec - 86400 * 2,
+        last_active_at: nowSec - 200,
+        usage: { model: 'gemini-4-hydrogen', input: 202_334, prompt: 352_883, output: 9_990, reasoning: 5_160 },
+      },
+      'bot-mus': {
+        model: 'gemini-4-neon',
+        provider: 'gemini',
+        started_at: nowSec - 86400 * 2,
+        last_active_at: nowSec - 300,
+        usage: { model: 'gemini-4-neon', input: 396_572, prompt: 1_515_112, output: 22_991, reasoning: 10_327 },
+      },
+      'bot-frg': {
+        model: 'gemini-4-carbon',
+        provider: 'gemini',
+        started_at: nowSec - 86400 * 2,
+        last_active_at: nowSec - 400,
+        usage: { model: 'gemini-4-carbon', input: 114_458, prompt: 1_645_813, output: 20_143, reasoning: 11_021 },
+      },
+    };
+
+    const cache = new Map();
+    const allSessions = await collectProfileSessionsForScope({
+      targetProfiles: ['default', 'forge', 'muse', 'scout'],
+      connScopeKey: 'tailscale-lemini',
+      effectiveConnId: 'tailscale-lemini',
+      canonicalByProfile,
+      botChatCache: cache,
+      gwCallFn: async (_route, method, params) => {
+        if (method === 'session.info') return sessionInfoPayloads[params.session_id];
+        throw new Error('unexpected');
+      },
+      hostObj: {
+        listPersistedSessions: async (_route, { profile }) => ({
+          sessions: persistedByProfile[profile] || [],
+        }),
+      },
+    });
+
+    assert.equal(allSessions.length, 7); // 4 hidden Bot Chats + 2 default rows + 1 scout row
+
+    // Focus on 总管 (default):
+    const liveDef = mergeUsageSources(sessionInfoPayloads['bot-def'].usage, {}, {}, {});
+    const aggWhenDefaultFocused = aggregatePersistedSessions(
+      allSessions,
+      'today',
+      ['bot-def'],
+      liveDef,
+      'gemini-4-neon',
+      nowMs,
+      { __aggOpts: true, activeProfileSlug: 'default', connScopeKey: 'tailscale-lemini' }
+    );
+
+    // Focus on 情报官 (scout):
+    const liveScout = mergeUsageSources(sessionInfoPayloads['bot-sct'].usage, {}, {}, {});
+    const aggWhenScoutFocused = aggregatePersistedSessions(
+      allSessions,
+      'today',
+      ['bot-sct'],
+      liveScout,
+      'gemini-4-hydrogen',
+      nowMs,
+      { __aggOpts: true, activeProfileSlug: 'scout', connScopeKey: 'tailscale-lemini' }
+    );
+
+    // Focus on 工程师 (forge):
+    const liveForge = mergeUsageSources(sessionInfoPayloads['bot-frg'].usage, {}, {}, {});
+    const aggWhenForgeFocused = aggregatePersistedSessions(
+      allSessions,
+      'today',
+      ['bot-frg'],
+      liveForge,
+      'gemini-4-carbon',
+      nowMs,
+      { __aggOpts: true, activeProfileSlug: 'forge', connScopeKey: 'tailscale-lemini' }
+    );
+
+    // INVARIANT: All-Bots spend and token totals are 100% IDENTICAL across every focused bot!
+    approxEqual(aggWhenDefaultFocused.costUsd, aggWhenScoutFocused.costUsd, 1e-6);
+    approxEqual(aggWhenDefaultFocused.costUsd, aggWhenForgeFocused.costUsd, 1e-6);
+    assert.equal(aggWhenDefaultFocused.total, aggWhenScoutFocused.total);
+    assert.equal(aggWhenDefaultFocused.sessionCount, 7);
+    // Expected total: 16.503666 + 0.389717 + 1.702362 + 0.583482 + 1.641824 + 0.3737 + 0.5751 ≈ $21.77
+    approxEqual(aggWhenDefaultFocused.costUsd, 21.76985, 1e-4);
+  });
+
+  it('tracks daily ledger baselines so cross-day forever Bot Chats report exact daily deltas after day rollover', () => {
+    const ctx = createMockCtx();
+    const ledger = loadUsageLedger(ctx);
+    const day1Ms = new Date(2026, 10, 26, 23, 0, 0).getTime();
+    const day2Ms = new Date(2026, 10, 27, 10, 0, 0).getTime();
+    const startedMs = new Date(2026, 10, 24, 20, 0, 0).getTime();
+
+    // Day 1 end state: cumulative $10.00, 2M fresh in, 5M cacheRead, 100k out
+    aggregatePersistedSessions(
+      [
+        {
+          id: 'bot-def',
+          _profile: 'default',
+          started_at: startedMs,
+          last_active: day1Ms,
+          input_tokens: 2_000_000,
+          cache_read_tokens: 5_000_000,
+          output_tokens: 100_000,
+          estimated_cost_usd: 10.0,
+        },
+      ],
+      'today',
+      [],
+      null,
+      '',
+      day1Ms,
+      { __aggOpts: true, activeProfileSlug: 'default', connScopeKey: 'local', ledger }
+    );
+    saveUsageLedger(ctx, ledger);
+
+    // Day 2: cumulative grew to $16.50 -> 'today' reports ONLY Day 2's $6.50 delta, while 'all' reports $16.50!
+    const reloaded = loadUsageLedger(ctx);
+    const day2Today = aggregatePersistedSessions(
+      [
+        {
+          id: 'bot-def',
+          _profile: 'default',
+          started_at: startedMs,
+          last_active: day2Ms,
+          input_tokens: 3_500_000,
+          cache_read_tokens: 9_000_000,
+          output_tokens: 150_000,
+          estimated_cost_usd: 16.5,
+        },
+      ],
+      'today',
+      [],
+      null,
+      '',
+      day2Ms,
+      { __aggOpts: true, activeProfileSlug: 'default', connScopeKey: 'local', ledger: reloaded }
+    );
+    approxEqual(day2Today.costUsd, 6.5);
+    assert.equal(day2Today.input, 1_500_000);
+    assert.equal(day2Today.cacheRead, 4_000_000);
+    assert.equal(day2Today.output, 50_000);
+
+    const day2All = aggregatePersistedSessions(
+      [
+        {
+          id: 'bot-def',
+          _profile: 'default',
+          started_at: startedMs,
+          last_active: day2Ms,
+          input_tokens: 3_500_000,
+          cache_read_tokens: 9_000_000,
+          output_tokens: 150_000,
+          estimated_cost_usd: 16.5,
+        },
+      ],
+      'all',
+      [],
+      null,
+      '',
+      day2Ms,
+      { __aggOpts: true, activeProfileSlug: 'default', connScopeKey: 'local', ledger: reloaded }
+    );
+    approxEqual(day2All.costUsd, 16.5);
   });
 });
 
@@ -1061,5 +1354,267 @@ describe('formatting, estimation, threshold & tone utilities', () => {
     const allLabel = buildScopeLabel({ usageScope: 'all', timeRange: '7d' }, 'Hermes', 3, I18N.en);
     assert.match(allLabel.pill, /3/);
     assert.ok(allLabel.chipPrefix.includes('7d'));
+  });
+});
+
+describe('v1.0.2 auditor hardening & ledger API dual-engine suite', () => {
+  it('handles 0% and 100% cache-hit tui_usage, nested token details, and single-bucket selection without double-counting', () => {
+    // 0% cache hit (`input === prompt`, `cache_hit_pct: 0`): pins cacheRead = 0 so stale cacheHitPct never re-splits input
+    const zeroHit = extractSourceTokenBuckets({ input: 50_000, prompt: 50_000, cache_hit_pct: 0 });
+    assert.equal(zeroHit.input, 50_000);
+    assert.equal(zeroHit.cacheRead, 0);
+    assert.equal(zeroHit.promptTokens, 50_000);
+    // Even if an external stale cacheHitPct=80 is passed, explicit cacheRead=0 prevents re-splitting!
+    approxEqual(estimateRawTokensUsd(zeroHit.input, 0, 'gemini-4-neon', zeroHit.cacheRead, 80), 0.15);
+
+    // 100% cache hit (`input === prompt`, `cache_hit_pct: 100`): shifts bucket to cacheRead
+    const fullHit = extractSourceTokenBuckets({ input: 50_000, prompt: 50_000, cache_hit_pct: 100 });
+    assert.equal(fullHit.input, 0);
+    assert.equal(fullHit.cacheRead, 50_000);
+    assert.equal(fullHit.promptTokens, 50_000);
+
+    // Nested OpenAI / Anthropic details objects
+    const nested = extractSourceTokenBuckets({
+      prompt_tokens: 100_000,
+      prompt_tokens_details: { cached_tokens: 70_000, cache_creation_tokens: 10_000 },
+    });
+    assert.equal(nested.input, 20_000);
+    assert.equal(nested.cacheRead, 70_000);
+    assert.equal(nested.cacheWrite, 10_000);
+    assert.equal(nested.promptTokens, 100_000);
+
+    // Cross-source safety: RPC has OpenAI shape (`prompt_tokens: 100k`, no cache field yet -> input=100k),
+    // while persisted row for the SAME turn has `input_tokens: 20k, cache_read_tokens: 80k` (prompt=100k).
+    // `mergeUsageSources` must pick the richer 100k bucket cleanly (20k + 80k = 100k), NOT 100k + 80k = 180k!
+    const crossMerged = mergeUsageSources(
+      {},
+      { prompt_tokens: 100_000, completion_tokens: 5_000 },
+      { input_tokens: 20_000, cache_read_tokens: 80_000, output_tokens: 5_000 },
+      {}
+    );
+    assert.equal(crossMerged.input, 20_000);
+    assert.equal(crossMerged.cacheRead, 80_000);
+    assert.equal(crossMerged.promptTokens, 100_000);
+  });
+
+  it('evaluates >200k tiered pricing per-call (promptTotal / calls) and covers gemini-3.1-pro & gpt-6 tiers', () => {
+    // Gemini 3.1 Pro: <=200k ($2/$12/$0.2), >200k ($4/$18/$0.4)
+    // Cumulative 300k across 6 API calls -> 50k/call -> base tier ($2/M * 0.3M = $0.60)
+    approxEqual(estimateRawTokensUsd(300_000, 0, 'gemini-3.1-pro', 0, null, 0, null, Date.now(), 0, 6), 0.6);
+    // Single call of 300k -> >200k tier ($4/M * 0.3M = $1.20)
+    approxEqual(estimateRawTokensUsd(300_000, 0, 'gemini-3.1-pro', 0, null, 0, null, Date.now(), 0, 1), 1.2);
+
+    // GPT-6 series pay-as-you-go fallback rates (aligned with Hermes `agent/usage_pricing.py`)
+    approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'gpt-6.2-astra'), 48.0);
+    approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'gpt-6-astra'), 60.0);
+    approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'gpt-6.2-sol'), 12.0);
+    approxEqual(estimateRawTokensUsd(1_000_000, 1_000_000, 'gpt-6-luna'), 0.6);
+  });
+
+  it('prevents double-counting compressed ancestor segments when focusing a rotated child session (`parent_session_id`)', () => {
+    const nowMs = Date.UTC(2026, 10, 27, 15, 0, 0);
+    // Parent S1 ($1.00) rotated via compression to child S2 ($0.20 persisted + $0.05 unsaved live delta = $1.25 full chain in memory)
+    const ledgerRows = [
+      {
+        id: 'S1',
+        _profile: 'default',
+        end_reason: 'compression',
+        started_at: nowMs - 7200_000,
+        last_active: nowMs - 3600_000,
+        input_tokens: 200_000,
+        output_tokens: 26_666,
+        estimated_cost_usd: 1.0,
+        model: 'gemini-4-neon',
+      },
+      {
+        id: 'S2',
+        _profile: 'default',
+        parent_session_id: 'S1',
+        started_at: nowMs - 3600_000,
+        last_active: nowMs - 60_000,
+        input_tokens: 40_000,
+        output_tokens: 5_333,
+        estimated_cost_usd: 0.2,
+        model: 'gemini-4-neon',
+      },
+      {
+        id: 'bot-sct',
+        _profile: 'scout',
+        started_at: nowMs - 1800_000,
+        last_active: nowMs - 30_000,
+        input_tokens: 100_000,
+        output_tokens: 20_000,
+        estimated_cost_usd: 0.3,
+        model: 'gemini-4-hydrogen',
+      },
+    ];
+
+    // Live runtime memory on `default` holds the FULL chain sum (S1 + S2 + $0.05 unsaved = $1.25, 250k in, 34k out)
+    const fullChainLiveDefault = {
+      input: 250_000,
+      cacheRead: 0,
+      cacheWrite: 0,
+      output: 34_000,
+      backendCost: 1.25,
+    };
+
+    const aggFocusedDefault = aggregatePersistedSessions(
+      ledgerRows,
+      'today',
+      ['S2'],
+      fullChainLiveDefault,
+      'gemini-4-neon',
+      nowMs,
+      { __aggOpts: true, activeProfileSlug: 'default', connScopeKey: 'local', mutateLedger: false }
+    );
+    // Must equal S1 ($1.00) + S2 ($0.25 net) + scout ($0.30) = $1.55 (NEVER $1.00 + $1.25 + $0.30 = $2.55!)
+    approxEqual(aggFocusedDefault.costUsd, 1.55);
+    assert.equal(aggFocusedDefault.input, 350_000);
+
+    // Once S2 persists $0.25 to DB and user clicks `scout`, All-Bots spend stays $1.55 identically!
+    ledgerRows[1] = { ...ledgerRows[1], input_tokens: 50_000, output_tokens: 7_334, estimated_cost_usd: 0.25 };
+    const aggFocusedScout = aggregatePersistedSessions(
+      ledgerRows,
+      'today',
+      ['bot-sct'],
+      { input: 100_000, output: 20_000, backendCost: 0.3 },
+      'gemini-4-hydrogen',
+      nowMs,
+      { __aggOpts: true, activeProfileSlug: 'scout', connScopeKey: 'local', mutateLedger: false }
+    );
+    approxEqual(aggFocusedScout.costUsd, 1.55);
+  });
+
+  it('keeps aggregatePersistedSessions pure when mutateLedger=false, anchors dormant sessions before cutoff, gates unaligned live _sid, and counts _is_aux cost without inflating sessionCount', () => {
+    const ledger = {};
+    const day2Ms = new Date(2026, 10, 27, 12, 0, 0).getTime();
+    const day1Ms = new Date(2026, 10, 26, 18, 0, 0).getTime();
+
+    const rows = [
+      // Dormant session from yesterday: excluded from 'today' spend, yet MUST still emit an observation!
+      {
+        id: 'dormant-1',
+        _profile: 'muse',
+        started_at: day1Ms - 3600_000,
+        last_active: day1Ms,
+        input_tokens: 500_000,
+        output_tokens: 50_000,
+        estimated_cost_usd: 2.25,
+      },
+      // Active session today on scout
+      {
+        id: 'bot-sct',
+        _profile: 'scout',
+        started_at: day2Ms - 1000,
+        last_active: day2Ms,
+        input_tokens: 100_000,
+        output_tokens: 10_000,
+        estimated_cost_usd: 0.225,
+      },
+      // Auxiliary task row (e.g. background_review): adds to spend & tokens, NOT to sessionCount
+      {
+        id: 'aux:bot-sct:background_review:gemini-4-hydrogen:gemini',
+        _is_aux: true,
+        _profile: 'scout',
+        started_at: day2Ms - 500,
+        last_active: day2Ms,
+        input_tokens: 20_000,
+        output_tokens: 2_000,
+        estimated_cost_usd: 0.045,
+      },
+    ];
+
+    // Stale liveMerged from previous bot (`liveSidAligned: false`) MUST NOT pollute `bot-sct`!
+    const staleHeavyLive = { input: 9_000_000, cacheRead: 15_000_000, output: 500_000, backendCost: 25.0 };
+    const agg = aggregatePersistedSessions(rows, 'today', ['bot-sct'], staleHeavyLive, 'gemini-4-hydrogen', day2Ms, {
+      __aggOpts: true,
+      activeProfileSlug: 'scout',
+      connScopeKey: 'tailscale-lemini',
+      ledger,
+      mutateLedger: false,
+      liveSidAligned: false,
+    });
+
+    // Pure render check: `ledger` was NOT mutated in place
+    assert.deepEqual(ledger, {});
+    // Dormant session + active session + aux row all emitted observations (3 total)
+    assert.equal(agg.observations.length, 3);
+    // Only non-aux active session counted in `sessionCount` (1), while spend includes aux ($0.225 + $0.045 = $0.27)
+    assert.equal(agg.sessionCount, 1);
+    approxEqual(agg.costUsd, 0.27);
+  });
+
+  it('prevents gwCall from replaying remote or JSON-RPC errors onto the local active socket', async () => {
+    let localSocketCalled = false;
+    const mockHost = {
+      state: {
+        profile: { get: () => 'default' },
+        connectionId: { get: () => 'local' },
+      },
+      requestProfile: async () => {
+        const rpcErr = new Error('Method not found');
+        rpcErr.code = -32601;
+        throw rpcErr;
+      },
+      request: async () => {
+        localSocketCalled = true;
+        return { ok: true };
+      },
+    };
+
+    // 1. JSON-RPC error on same profile/connection must throw, never replay via `request`
+    await assert.rejects(
+      () => gwCall({ connectionId: 'local', mode: 'local', profile: 'default', targetProfile: 'default' }, 'session.info', {}, 'default', mockHost),
+      /Method not found/
+    );
+    assert.equal(localSocketCalled, false);
+
+    // 2. Transport error on a DIFFERENT connection ('tailscale-remote' vs 'local') with same profile 'default' must throw!
+    const mockHostCrossConn = {
+      ...mockHost,
+      requestProfile: async () => {
+        throw new Error('Remote tunnel timeout');
+      },
+    };
+    await assert.rejects(
+      () => gwCall({ connectionId: 'tailscale-remote', mode: 'remote', profile: 'default', targetProfile: 'default' }, 'session.compress', {}, 'default', mockHostCrossConn),
+      /Remote tunnel timeout/
+    );
+    assert.equal(localSocketCalled, false);
+  });
+
+  it('fetches authoritative backend /ledger via ctx.rest and degrades cleanly to null when absent', async () => {
+    assert.equal(await fetchBackendLedger({}), null);
+    assert.equal(
+      await fetchBackendLedger({
+        rest: async () => {
+          throw new Error('404 Not Found');
+        },
+      }),
+      null
+    );
+
+    const okLedger = await fetchBackendLedger({
+      rest: async (path) => {
+        assert.equal(path, '/ledger');
+        return {
+          ok: true,
+          profiles: [
+            { name: 'default', title: '总管', model: 'gemini-4-neon', provider: 'gemini' },
+            { name: 'scout', title: '情报官', model: 'gemini-4-hydrogen', provider: 'gemini' },
+          ],
+          entries: [{ id: 's1', _profile: 'default', input_tokens: 1000, estimated_cost_usd: 0.05 }],
+        };
+      },
+    });
+    assert.ok(okLedger);
+    assert.deepEqual(okLedger.names, ['default', 'scout']);
+    assert.equal(okLedger.titles.default, '总管');
+    assert.equal(okLedger.entries.length, 1);
+
+    // Async storage safety: Promise-like return values from custom storage adapters do not crash loadPrefs / loadUsageLedger
+    const asyncCtx = { storage: { get: () => Promise.resolve({ showBar: false }) } };
+    assert.equal(loadPrefs(asyncCtx).showBar, true);
+    assert.deepEqual(loadUsageLedger(asyncCtx), {});
   });
 });

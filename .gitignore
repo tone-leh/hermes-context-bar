@@ -2,3 +2,6 @@
 node_modules/
 *.log
 catalog-entry.example.yaml
+__pycache__/
+*.py[cod]
+

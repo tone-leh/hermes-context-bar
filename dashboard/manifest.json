@@ -1,0 +1,14 @@
+{
+  "name": "hermes-context-bar",
+  "label": "Context Bar",
+  "description": "Read-only SQLite session and auxiliary-task spend ledger for Context Bar",
+  "icon": "Activity",
+  "version": "1.0.2",
+  "tab": {
+    "path": "/context-bar",
+    "hidden": true
+  },
+  "slots": [],
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}

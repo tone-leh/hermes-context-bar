@@ -1,13 +1,14 @@
 name: hermes-context-bar
 label: Context Bar
-version: 1.0.1
+version: 1.0.2
 author: tone-leh
 homepage: https://github.com/tone-leh/hermes-context-bar
 description: >
   Always-on context runway, live token generation speed (tok/s), Claude Code
   /context-style category breakdown, customizable status bar, multi-bot and
   multi-currency spend tracking, one-click manual compaction, and read-only
-  context & memory policy overview for Hermes Desktop. Desktop-only
-  (desktop/plugin.js); pure Plugin SDK, zero extra LLM tokens, zero external
-  network calls, and zero credential access.
+  context & memory policy overview for Hermes Desktop. Includes optional
+  read-only dashboard ledger endpoint (dashboard/plugin_api.py) with automatic
+  pure-SDK fallback; zero extra LLM tokens, zero external network calls, and
+  zero credential access.
 tags: [desktop, context, usage, statusbar, compression]

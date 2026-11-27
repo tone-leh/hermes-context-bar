@@ -56,10 +56,11 @@
 
 ## 隐私与工程边界
 
-- **纯桌面端单文件（`desktop/plugin.js`）**：不装 Python 后端、不向模型注入任何工具或提示词、**0 额外 Token 消耗**。
-- **纯官方 SDK 与零外部联网**：所有数据均通过官方 `@hermes/plugin-sdk`（`host.state`、`host.request`、`host.requestProfile`、`ctx.storage`）从本地或远程（Tailscale / 局域网）Hermes 网关读取，不触碰底层私有桥接；多币种换算纯本地计算，不请求第三方汇率接口。
-- **零凭据读取**：不触碰 `.env`、API Key 或任何 OAuth 登录态。
-- **零源码补丁**：遵循 Hermes Desktop 插件目录规范加载，软件升级不受影响。
+- **双引擎全量对账架构（`dashboard/plugin_api.py` + `desktop/plugin.js`）**：网关侧启用插件时，通过只读 SQLite 账本接口（`/api/plugins/hermes-context-bar/ledger`）完整汇总全员各角色的隐藏主对话（`Bot Chat`）、子代理、定时任务、看板/群聊及视觉/压缩/后台审阅等辅助调用账单，与云端官方账单严密对齐；单文件桌面模式下自动回退纯 SDK 采集。不向模型注入任何工具或提示词，**0 额外 Token 消耗**。
+- **官方阶梯单价与订阅免计费识别**：内置对齐 Google Cloud / AI Studio、Anthropic 与 OpenAI 官方单价及 `>200k` 阶梯费率，同时自动识别订阅套餐与本地推理渠道（`openai-codex`、本地回环代理、Ollama/vLLM）计为 `$0.00` 边际现金消耗。
+- **纯官方 SDK 与零外部联网**：所有前端通信均走官方 `@hermes/plugin-sdk`（`ctx.rest`、`host.state`、`host.request`、`host.requestProfile`、`ctx.storage`），支持本地与 Tailscale 远程网关；多币种换算纯离线计算，不请求第三方接口。
+- **零凭据读取**：不读取相关密钥文件、API Key 或任何 OAuth 登录态。
+- **零源码补丁**：遵循 Hermes 原生插件目录规范加载，软件升级不受影响。
 
 ---
 

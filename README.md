@@ -33,7 +33,7 @@ Hover or click the bottom-left status bar to see the live state of whichever bot
 ### 2. Read-Only Context & Memory Policy Overview + Quick Settings Jump
 Right inside the **Policy** tab (or by clicking the threshold link on the main card), inspect the active bot profile's context and memory policy read-only via the official Desktop Plugin SDK (`config.get`), with a one-click jump to Hermes Settings whenever you want to edit:
 - **Auto-compression overview**: inspect active state (`compression.enabled`), trigger threshold (`compression.threshold`), target summary ratio (`compression.target_ratio`), protected recent turns (`compression.protect_last_n`), and `context.engine` (with clear fallback markers when defaults apply).
-- **Memory budget overview**: inspect persistent memory (`memory.memory_enabled`), profile memory state, and character limits (`memory.memory_char_limit` / `memory.user_char_limit`) that govern memory's share of your context window.
+- **Memory budget overview**: inspect persistent memory (`memory.memory_enabled`), profile memory state, and character limits (`memory.memory_char_limit` / `memory.user_char_limit`) that govern memory budget within the window.
 - **One-click Open Settings**: Policy stays strictly read-only inside the plugin; click **Open Settings ↗** to jump directly to Hermes Desktop's official Settings page to modify configuration safely.
 
 ### 3. DIY Status Bar & Multi-Scope Consumption
@@ -56,10 +56,11 @@ Right-click the status bar (or click the sliders icon) to configure every detail
 
 ## Privacy & Architecture
 
-- **Desktop-only single file (`desktop/plugin.js`)**: no Python backend, no agent tools/hooks injected into prompts, **0 extra tokens consumed**.
-- **Zero external network requests & pure SDK compliance**: all data comes from your own Hermes gateway (local or remote over Tailscale/LAN) strictly via the official `@hermes/plugin-sdk` (`host.state`, `host.request`, `host.requestProfile`, `ctx.storage`) — no raw Electron bridge calls. Currency conversion runs strictly offline using your local rate table.
+- **Dual-engine ledger (`dashboard/plugin_api.py` + `desktop/plugin.js`)**: when enabled on a Hermes gateway, a lightweight read-only SQLite endpoint (`/api/plugins/hermes-context-bar/ledger`) aggregates every profile's full session history (including hidden `Bot Chat`, subagents, cron jobs, kanban/group chats, and auxiliary vision/compression/review calls) for exact alignment with cloud billing; in standalone desktop-only mode it falls back automatically to pure SDK queries. Injects zero agent tools/hooks and consumes **0 extra LLM tokens**.
+- **Official API pricing & subscription awareness**: aligns fallback rates with official Google Cloud / AI Studio, Anthropic, and OpenAI schedules (including tiered `>200k` prompt pricing), while recognizing subscription/local routes (`openai-codex`, local loopback proxies, Ollama/vLLM) as `$0.00` marginal cash spend.
+- **Zero external network requests & pure SDK compliance**: all desktop data flows strictly through the official `@hermes/plugin-sdk` (`ctx.rest`, `host.state`, `host.request`, `host.requestProfile`, `ctx.storage`) — no raw Electron bridge calls. Currency conversion runs strictly offline using your local rate table.
 - **Zero credential access**: never reads `.env`, API keys, or OAuth tokens.
-- **Zero core patches**: loads cleanly through Hermes Desktop's native plugin directory and survives app upgrades untouched.
+- **Zero core patches**: loads cleanly through Hermes's native plugin directories and survives app upgrades untouched.
 
 ---
 

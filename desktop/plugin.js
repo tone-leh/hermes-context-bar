@@ -125,6 +125,7 @@ const I18N = {
     compactDone: '已压缩',
     compactFailed: '压缩失败',
     input: '输入',
+    cachedInput: '缓存读取',
     output: '输出',
     reasoning: '思考',
     total: '合计',
@@ -256,6 +257,7 @@ const I18N = {
     compactDone: 'Compacted',
     compactFailed: 'Compact failed',
     input: 'Input',
+    cachedInput: 'Cache read',
     output: 'Output',
     reasoning: 'Reasoning',
     total: 'Total',
@@ -400,7 +402,10 @@ const MODEL_PRICING = [
   [/gemini[-./]*3\.5[-.]*flash[-.]*lite/i, [0.3, 2.5, 0.03]],
   [/gemini[-./]*3\.5[-.]*flash/i, [1.5, 9.0, 0.15]],
   [/gemini[-./]*3\.1[-.]*flash[-.]*lite/i, [0.25, 1.5, 0.025]],
-  [/gemini[-./]*3(\.1)?[-.]*pro/i, [2.0, 12.0, 0.2]],
+  [
+    /gemini[-./]*3(\.1)?[-.]*pro/i,
+    [2.0, 12.0, 0.2, { tierThresholdTokens: 200_000, aboveRates: [4.0, 18.0, 0.4] }],
+  ],
   [/gemini[-./]*3[-.]*flash/i, [0.5, 3.0, 0.05]],
   // --- Google Gemini 2.5 / 2.0 Official API ---
   [
@@ -423,6 +428,10 @@ const MODEL_PRICING = [
   [/claude[-./]*haiku[-./]*4[-.]*5/i, [1.0, 5.0, 0.1]],
   [/claude.*haiku/i, [0.8, 4.0, 0.08]],
   // --- OpenAI Pay-As-You-Go API (subscription routes short-circuit to $0 before this table) ---
+  [/gpt-6\.2[-.]*astra/i, [8.0, 40.0, 0.4]],
+  [/gpt-6[-.]*astra/i, [10.0, 50.0, 1.0]],
+  [/gpt-6\.2[-.]*sol/i, [2.0, 10.0, 0.1]],
+  [/gpt-6[-.]*luna/i, [0.1, 0.5, 0.01]],
   [/gpt-5\.6-sol/i, [5.0, 30.0, 0.5]],
   [/gpt-5\.6-terra/i, [2.5, 15.0, 0.25]],
   [/gpt-5\.6-luna/i, [1.0, 6.0, 0.1]],
@@ -1305,10 +1314,14 @@ function loadPrefs(ctx) {
   try {
     if (ctx?.storage && typeof ctx.storage.get === 'function') {
       const saved = ctx.storage.get(STORAGE_KEY, null);
-      if (saved) return sanitizePrefs(saved);
+      if (saved && typeof saved === 'object' && typeof saved.then !== 'function') {
+        return sanitizePrefs(saved);
+      }
       for (const oldKey of PREV_STORAGE_KEYS) {
         const prev = ctx.storage.get(oldKey, null);
-        if (prev && typeof prev === 'object') return sanitizePrefs(prev);
+        if (prev && typeof prev === 'object' && typeof prev.then !== 'function') {
+          return sanitizePrefs(prev);
+        }
       }
     }
   } catch {}
@@ -1600,6 +1613,7 @@ function isZeroMarginalCostSource(...sources) {
 
 function resolveModelRates(entryRates, promptTokens, nowMs) {
   let [inRate, outRate, cacheRate, opts] = entryRates;
+  let cacheWriteRate = null;
   if (opts && typeof opts === 'object') {
     if (opts.effectiveAtMs != null && Array.isArray(opts.nextRates) && nowMs >= opts.effectiveAtMs) {
       [inRate, outRate, cacheRate] = opts.nextRates;
@@ -1607,8 +1621,11 @@ function resolveModelRates(entryRates, promptTokens, nowMs) {
     if (opts.tierThresholdTokens != null && Array.isArray(opts.aboveRates) && promptTokens > opts.tierThresholdTokens) {
       [inRate, outRate, cacheRate] = opts.aboveRates;
     }
+    if (typeof opts.cacheWriteRate === 'number' && Number.isFinite(opts.cacheWriteRate)) {
+      cacheWriteRate = opts.cacheWriteRate;
+    }
   }
-  return [inRate, outRate, cacheRate];
+  return [inRate, outRate, cacheRate, cacheWriteRate ?? inRate * 1.25];
 }
 
 function estimateRawTokensUsd(
@@ -1619,25 +1636,137 @@ function estimateRawTokensUsd(
   cacheHitPct = null,
   reasoning = 0,
   total = null,
-  nowMs = Date.now()
+  nowMs = Date.now(),
+  cacheWrite = null,
+  calls = null
 ) {
-  const i = input ?? 0;
-  const o = output ?? 0;
-  if (i === 0 && o === 0) return null;
+  const rawIn = Math.max(0, input ?? 0);
+  const o = Math.max(0, output ?? 0);
+  const cWr = Math.max(0, cacheWrite ?? 0);
+  const hasExplicitCache = cacheRead != null && Number.isFinite(cacheRead) && cacheRead >= 0;
+  const cRd = hasExplicitCache ? cacheRead : 0;
+  if (rawIn === 0 && o === 0 && cRd === 0 && cWr === 0) return null;
   if (!modelName) return null;
   const matched = MODEL_PRICING.find(([re]) => re.test(modelName));
   if (!matched) return null;
-  const [inRate, outRate, cacheRate] = resolveModelRates(matched[1], i, nowMs);
-  const cachedIn =
-    cacheRead != null
-      ? Math.min(i, cacheRead)
-      : cacheHitPct != null && cacheHitPct > 0
-        ? i * Math.min(1, cacheHitPct / 100)
-        : 0;
-  const freshIn = Math.max(0, i - cachedIn);
-  const r = reasoning ?? 0;
-  const reasoningExtra = r > 0 && total != null && total >= i + o + r ? r : 0;
-  return (freshIn * inRate + cachedIn * cacheRate + (o + reasoningExtra) * outRate) / 1e6;
+
+  // Hermes normalizes `input` / `input_tokens` to UNCACHED fresh input (already excluding
+  // `cache_read_tokens` and `cache_write_tokens`). Never subtract `cacheRead` from `input` again.
+  // Only split `rawIn` by `cacheHitPct` when no explicit `cacheRead` bucket was provided.
+  let freshIn = rawIn;
+  let cachedIn = cRd;
+  if (!hasExplicitCache && cacheHitPct != null && cacheHitPct > 0) {
+    const ratio = Math.min(1, Math.max(0, cacheHitPct / 100));
+    cachedIn = rawIn * ratio;
+    freshIn = Math.max(0, rawIn - cachedIn);
+  }
+
+  const promptTotal = freshIn + cachedIn + cWr;
+  const callCount = toNum(calls);
+  const perCallPrompt = callCount != null && callCount > 1 ? promptTotal / callCount : promptTotal;
+  const [inRate, outRate, cacheRate, cacheWriteRate] = resolveModelRates(matched[1], perCallPrompt, nowMs);
+  const r = Math.max(0, reasoning ?? 0);
+  const reasoningExtra = r > 0 && total != null && total >= promptTotal + o + r ? r : 0;
+  return (
+    freshIn * inRate +
+    cachedIn * cacheRate +
+    cWr * cacheWriteRate +
+    (o + reasoningExtra) * outRate
+  ) / 1e6;
+}
+
+function extractSourceTokenBuckets(src) {
+  if (!src || typeof src !== 'object') {
+    return { input: null, cacheRead: null, cacheWrite: null, promptTokens: null, hasAny: false };
+  }
+  const pDetails =
+    (src.prompt_tokens_details && typeof src.prompt_tokens_details === 'object'
+      ? src.prompt_tokens_details
+      : null) ||
+    (src.input_tokens_details && typeof src.input_tokens_details === 'object'
+      ? src.input_tokens_details
+      : null);
+
+  const explicitInput = pickBestNum(src.input, src.input_tokens);
+  const promptField = pickBestNum(src.prompt, src.prompt_tokens);
+  const explicitCacheRead = pickBestNum(
+    src.cache_read_tokens,
+    src.cache_read,
+    src.cacheRead,
+    src.cacheReadTokens,
+    src.cache_read_input_tokens,
+    src.cached_tokens,
+    src.cached_input_tokens,
+    pDetails?.cached_tokens,
+    pDetails?.cache_read_tokens,
+    pDetails?.cache_read_input_tokens
+  );
+  const cacheWrite = pickBestNum(
+    src.cache_write_tokens,
+    src.cache_write,
+    src.cacheWrite,
+    src.cacheWriteTokens,
+    src.cache_creation_input_tokens,
+    pDetails?.cache_creation_tokens,
+    pDetails?.cache_write_tokens,
+    pDetails?.cache_creation_input_tokens
+  );
+
+  // `tui_usage` (liveUsage / session.info.usage) reports uncached `input` + total `prompt`
+  // without a separate `cache_read_tokens` key.
+  let input = explicitInput;
+  let cacheRead = explicitCacheRead;
+  if (cacheRead == null && promptField != null && explicitInput != null) {
+    const cw = cacheWrite ?? 0;
+    if (promptField > explicitInput + cw) {
+      cacheRead = promptField - explicitInput - cw;
+    } else if (promptField > 0 && promptField === explicitInput + cw) {
+      const srcHitPct = toNum(src.cache_hit_pct ?? src.cacheHitPct);
+      if (srcHitPct != null && srcHitPct >= 100) {
+        input = 0;
+        cacheRead = Math.max(0, promptField - cw);
+      } else {
+        // Explicit 0% cache hit (`prompt === input`): pin cacheRead = 0 so downstream never re-splits by stale cacheHitPct.
+        cacheRead = 0;
+      }
+    }
+  }
+
+  // Raw OpenAI-shaped payloads with `prompt_tokens` + `cached_input_tokens` (no `input_tokens`):
+  // derive uncached fresh `input` by subtracting cache buckets once.
+  if (input == null && promptField != null) {
+    input = Math.max(0, promptField - (cacheRead ?? 0) - (cacheWrite ?? 0));
+  }
+
+  let promptTokens = null;
+  if (input != null || cacheRead != null || cacheWrite != null) {
+    const sumPrompt = (input ?? 0) + (cacheRead ?? 0) + (cacheWrite ?? 0);
+    promptTokens = promptField != null ? Math.max(promptField, sumPrompt) : sumPrompt;
+  } else if (promptField != null) {
+    promptTokens = promptField;
+  }
+
+  const hasAny = input != null || cacheRead != null || cacheWrite != null || promptTokens != null;
+  return { input, cacheRead, cacheWrite, promptTokens, hasAny };
+}
+
+function selectAuthoritativePromptBucket(...buckets) {
+  let chosen = null;
+  for (const b of buckets) {
+    if (!b || !b.hasAny) continue;
+    if (!chosen) {
+      chosen = b;
+      continue;
+    }
+    const curP = chosen.promptTokens ?? 0;
+    const nextP = b.promptTokens ?? 0;
+    if (nextP > curP) {
+      chosen = b;
+    } else if (nextP === curP && chosen.cacheRead == null && b.cacheRead != null) {
+      chosen = b;
+    }
+  }
+  return chosen || { input: null, cacheRead: null, cacheWrite: null, promptTokens: null, hasAny: false };
 }
 
 function mergeUsageSources(liveUsage, rpcUsage, persistedSession, breakdown) {
@@ -1646,21 +1775,32 @@ function mergeUsageSources(liveUsage, rpcUsage, persistedSession, breakdown) {
   const ps = persistedSession && typeof persistedSession === 'object' ? persistedSession : {};
   const bd = breakdown && typeof breakdown === 'object' ? breakdown : {};
 
-  const input = pickBestNum(
-    a.input, a.input_tokens, a.prompt_tokens,
-    b.input, b.input_tokens, b.prompt_tokens,
-    ps.input_tokens, ps.prompt_tokens
-  );
+  const bucketA = extractSourceTokenBuckets(a);
+  const bucketB = extractSourceTokenBuckets(b);
+  const bucketPs = extractSourceTokenBuckets(ps);
+
+  // Pick a single coherent source bucket (highest prompt watermark, priority live > rpc > persisted)
+  // rather than mixing `input` from one shape with `cacheRead` from another.
+  const bestBucket = selectAuthoritativePromptBucket(bucketA, bucketB, bucketPs);
+  const input = bestBucket.input;
+  const cacheRead = bestBucket.cacheRead;
+  const cacheWrite = bestBucket.cacheWrite;
+  const promptTokens = bestBucket.promptTokens;
+
   const output = pickBestNum(
-    a.output, a.output_tokens, a.completion_tokens,
-    b.output, b.output_tokens, b.completion_tokens,
+    a.output, a.output_tokens, a.completion, a.completion_tokens,
+    b.output, b.output_tokens, b.completion, b.completion_tokens,
     ps.output_tokens, ps.completion_tokens
   );
   const reasoning = pickBestNum(a.reasoning, a.reasoning_tokens, b.reasoning, b.reasoning_tokens, ps.reasoning_tokens);
+  const rawTotal = pickBestNum(a.total, a.total_tokens, b.total, b.total_tokens, ps.total_tokens);
+  const billedSum =
+    promptTokens != null || output != null ? (promptTokens ?? (input || 0)) + (output || 0) : null;
   const total =
-    pickBestNum(a.total, a.total_tokens, b.total, b.total_tokens, ps.total_tokens) ??
-    (input != null || output != null ? (input || 0) + (output || 0) : null);
-  const calls = pickBestNum(a.calls, a.api_calls, b.calls, b.api_calls, ps.api_calls);
+    billedSum != null && rawTotal != null
+      ? Math.max(billedSum, rawTotal)
+      : (billedSum ?? rawTotal);
+  const calls = pickBestNum(a.calls, a.api_calls, b.calls, b.api_calls, ps.api_calls, ps.api_call_count);
 
   const bdCatSum = Array.isArray(bd.categories)
     ? bd.categories.reduce((acc, c) => acc + (toNum(c?.tokens) ?? 0), 0)
@@ -1675,17 +1815,10 @@ function mergeUsageSources(liveUsage, rpcUsage, persistedSession, breakdown) {
       ? Math.max(0, Math.min(100, (ctxUsed / ctxMax) * 100))
       : pickBestNum(bd.context_percent, a.context_percent, b.context_percent);
 
-  // Support both snake_case and camelCase cache fields from gateway & provider usage
-  const cacheRead = pickBestNum(
-    a.cache_read_tokens, a.cache_read, a.cacheRead, a.cacheReadTokens, a.cache_read_input_tokens, a.cached_tokens, a.cached_input_tokens,
-    b.cache_read_tokens, b.cache_read, b.cacheRead, b.cacheReadTokens, b.cache_read_input_tokens, b.cached_tokens, b.cached_input_tokens,
-    ps.cache_read_tokens, ps.cache_read, ps.cached_tokens
-  );
-  const promptBase = pickBestNum(a.prompt, a.prompt_tokens, b.prompt, b.prompt_tokens, ps.input_tokens, input);
   const directCachePct = pickBestNum(a.cache_hit_pct, a.cacheHitPct, b.cache_hit_pct, b.cacheHitPct);
   const derivedCachePct =
-    cacheRead != null && cacheRead > 0 && promptBase && promptBase > 0
-      ? Math.max(0, Math.min(100, Math.round((cacheRead / promptBase) * 100)))
+    cacheRead != null && cacheRead > 0 && promptTokens && promptTokens > 0
+      ? Math.max(0, Math.min(100, Math.round((cacheRead / promptTokens) * 100)))
       : null;
   const cacheHitPct =
     directCachePct != null && directCachePct > 0
@@ -1700,7 +1833,12 @@ function mergeUsageSources(liveUsage, rpcUsage, persistedSession, breakdown) {
     b.actual_cost_usd, b.cost_usd, b.estimated_cost_usd,
     ps.actual_cost_usd, ps.cost_usd, ps.estimated_cost_usd
   );
-  const hasUsageActivity = (input ?? 0) > 0 || (output ?? 0) > 0 || (calls ?? 0) > 0;
+  const hasUsageActivity =
+    (input ?? 0) > 0 ||
+    (cacheRead ?? 0) > 0 ||
+    (cacheWrite ?? 0) > 0 ||
+    (output ?? 0) > 0 ||
+    (calls ?? 0) > 0;
   const backendCost =
     directBackendCost != null
       ? directBackendCost
@@ -1709,25 +1847,139 @@ function mergeUsageSources(liveUsage, rpcUsage, persistedSession, breakdown) {
         : null;
 
   return {
-    input, output, reasoning, total, calls,
-    ctxUsed, ctxMax, ctxPct,
-    cacheRead, cacheHitPct, compressions,
-    avgTps, avgLatency, backendCost,
+    input,
+    cacheRead,
+    cacheWrite,
+    promptTokens,
+    output,
+    reasoning,
+    total,
+    calls,
+    ctxUsed,
+    ctxMax,
+    ctxPct,
+    cacheHitPct,
+    compressions,
+    avgTps,
+    avgLatency,
+    backendCost,
   };
 }
 
 function estimateSessionCost(merged, modelName, ...routeHints) {
   if (merged.backendCost != null) return { amount: merged.backendCost, estimated: false };
-  const hasTok = (merged.input ?? 0) > 0 || (merged.output ?? 0) > 0;
+  const hasTok =
+    (merged.input ?? 0) > 0 ||
+    (merged.cacheRead ?? 0) > 0 ||
+    (merged.cacheWrite ?? 0) > 0 ||
+    (merged.output ?? 0) > 0;
   if (hasTok && isZeroMarginalCostSource(...routeHints)) {
     return { amount: 0, estimated: false };
   }
   const usd = estimateRawTokensUsd(
-    merged.input, merged.output, modelName,
-    merged.cacheRead, merged.cacheHitPct, merged.reasoning, merged.total
+    merged.input,
+    merged.output,
+    modelName,
+    merged.cacheRead,
+    merged.cacheHitPct,
+    merged.reasoning,
+    merged.total,
+    Date.now(),
+    merged.cacheWrite,
+    merged.calls
   );
   if (usd == null) return { amount: null, estimated: true };
   return { amount: usd, estimated: true };
+}
+
+const LEDGER_STORAGE_KEY = 'usageBaselines.v1';
+const LEDGER_FALLBACK_LS_KEY = 'hermes.plugin.hermes-context-bar.usageBaselines.v1';
+const LEDGER_MAX_DAYS = 40;
+
+function formatLocalDayKey(epochMs) {
+  const d = new Date(epochMs);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function loadUsageLedger(ctx) {
+  try {
+    if (ctx?.storage && typeof ctx.storage.get === 'function') {
+      const saved = ctx.storage.get(LEDGER_STORAGE_KEY, null);
+      if (saved && typeof saved === 'object' && !Array.isArray(saved) && typeof saved.then !== 'function') {
+        return saved;
+      }
+    }
+  } catch {}
+  try {
+    const raw = globalThis.localStorage?.getItem(LEDGER_FALLBACK_LS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return parsed;
+    }
+  } catch {}
+  return {};
+}
+
+function saveUsageLedger(ctx, ledger) {
+  if (!ledger || typeof ledger !== 'object') return;
+  const days = Object.keys(ledger).sort();
+  const trimmed = {};
+  for (const dayKey of days.slice(-LEDGER_MAX_DAYS)) {
+    if (ledger[dayKey] && typeof ledger[dayKey] === 'object') {
+      trimmed[dayKey] = ledger[dayKey];
+    }
+  }
+  try {
+    if (ctx?.storage && typeof ctx.storage.set === 'function') {
+      ctx.storage.set(LEDGER_STORAGE_KEY, trimmed);
+      return;
+    }
+  } catch {}
+  try {
+    globalThis.localStorage?.setItem(LEDGER_FALLBACK_LS_KEY, JSON.stringify(trimmed));
+  } catch {}
+}
+
+function lookupLedgerBaseline(ledger, cutoffDayKey, sessionKey) {
+  if (!ledger || typeof ledger !== 'object' || !cutoffDayKey || !sessionKey) return null;
+  const priorDays = Object.keys(ledger)
+    .filter((d) => d < cutoffDayKey)
+    .sort();
+  for (let i = priorDays.length - 1; i >= 0; i--) {
+    const snap = ledger[priorDays[i]]?.[sessionKey];
+    if (snap && typeof snap === 'object') return snap;
+  }
+  return null;
+}
+
+function recordLedgerObservation(ledger, dayKey, sessionKey, cur) {
+  if (!ledger || typeof ledger !== 'object' || !dayKey || !sessionKey) return false;
+  const bucket = ledger[dayKey] && typeof ledger[dayKey] === 'object' ? ledger[dayKey] : {};
+  const prev = bucket[sessionKey];
+  const next = {
+    input: Math.max(prev?.input ?? 0, cur.input ?? 0),
+    cacheRead: Math.max(prev?.cacheRead ?? 0, cur.cacheRead ?? 0),
+    cacheWrite: Math.max(prev?.cacheWrite ?? 0, cur.cacheWrite ?? 0),
+    output: Math.max(prev?.output ?? 0, cur.output ?? 0),
+    costUsd:
+      cur.costUsd != null || prev?.costUsd != null
+        ? Math.max(prev?.costUsd ?? 0, cur.costUsd ?? 0)
+        : null,
+  };
+  const changed =
+    !prev ||
+    prev.input !== next.input ||
+    prev.cacheRead !== next.cacheRead ||
+    prev.cacheWrite !== next.cacheWrite ||
+    prev.output !== next.output ||
+    prev.costUsd !== next.costUsd;
+  if (changed) {
+    ledger[dayKey] = { ...bucket, [sessionKey]: next };
+  }
+  return changed;
 }
 
 function aggregatePersistedSessions(
@@ -1739,51 +1991,190 @@ function aggregatePersistedSessions(
   nowMs = Date.now(),
   ...liveRouteHints
 ) {
+  // Optional trailing options bag (keeps 100% backward-compatible signature for existing callers)
+  let aggOpts = null;
+  if (
+    liveRouteHints.length > 0 &&
+    liveRouteHints[liveRouteHints.length - 1] &&
+    typeof liveRouteHints[liveRouteHints.length - 1] === 'object' &&
+    liveRouteHints[liveRouteHints.length - 1].__aggOpts === true
+  ) {
+    aggOpts = liveRouteHints.pop();
+  }
+  const activeProfileSlug = aggOpts?.activeProfileSlug || null;
+  const ledger = aggOpts?.ledger || null;
+  const mutateLedger = aggOpts?.mutateLedger !== false;
+  const liveSidAligned = aggOpts?.liveSidAligned !== false;
+  const connScopeKey = aggOpts?.connScopeKey || 'local';
+
   const cutoffMs = getTimeRangeCutoffMs(timeRange, nowMs);
+  const cutoffDayKey = cutoffMs > 0 ? formatLocalDayKey(cutoffMs) : '';
+  const todayDayKey = formatLocalDayKey(nowMs);
   const activeSet = new Set((activeCandidateIds || []).filter(Boolean));
-  const byId = new Map();
+  const allByKey = new Map();
+
   for (const s of sessions) {
     if (!s || typeof s !== 'object') continue;
     const id = String(s.id || s.session_id || '');
     if (!id) continue;
-    const ts = toEpochMs(s.last_active ?? s.last_activity_at) ?? toEpochMs(s.started_at);
-    if (cutoffMs > 0 && (ts == null || ts < cutoffMs)) continue;
-    if (!byId.has(id)) byId.set(id, s);
+    const sProf = String(s._profile || s.profile || '').trim();
+    const dedupKey = sProf ? `${sProf}:${id}` : id;
+    if (!allByKey.has(dedupKey)) allByKey.set(dedupKey, { id, sProf, row: s });
   }
 
   let input = 0;
+  let cacheRead = 0;
+  let cacheWrite = 0;
   let output = 0;
   let costUsd = 0;
   let hasAnyCost = false;
   let anyEstimated = false;
   let matchedActive = false;
+  let ledgerDirty = false;
+  let sessionCount = 0;
+  const observations = [];
 
-  for (const [id, s] of byId.entries()) {
-    let sIn = toNum(s.input_tokens) ?? 0;
-    let sOut = toNum(s.output_tokens) ?? 0;
+  const sumLineageAncestors = (startParentId, sProf) => {
+    let ancIn = 0;
+    let ancCr = 0;
+    let ancCw = 0;
+    let ancOut = 0;
+    let ancRsn = 0;
+    let ancCalls = 0;
+    let ancCost = 0;
+    let curPid = String(startParentId || '').trim();
+    const visited = new Set();
+    while (curPid && !visited.has(curPid)) {
+      visited.add(curPid);
+      const ancKey = sProf ? `${sProf}:${curPid}` : curPid;
+      const ancEntry = allByKey.get(ancKey) || allByKey.get(curPid);
+      if (!ancEntry?.row) break;
+      const ar = ancEntry.row;
+      if (ar.end_reason && String(ar.end_reason) !== 'compression') break;
+      const ab = extractSourceTokenBuckets(ar);
+      const aIn = ab.input ?? 0;
+      const aCr = ab.cacheRead ?? 0;
+      const aCw = ab.cacheWrite ?? 0;
+      const aOut = toNum(ar.output_tokens ?? ar.output ?? ar.completion_tokens) ?? 0;
+      const aRsn = toNum(ar.reasoning_tokens ?? ar.reasoning) ?? 0;
+      const aCalls = pickBestNum(ar.api_call_count, ar.api_calls, ar.calls) ?? 0;
+      let aCost = pickBestNum(ar.actual_cost_usd, ar.cost_usd, ar.estimated_cost_usd);
+      if (aCost == null && (aIn > 0 || aCr > 0 || aCw > 0 || aOut > 0) && !isZeroMarginalCostSource(ar)) {
+        aCost = estimateRawTokensUsd(aIn, aOut, ar.model || liveModelName, aCr, null, aRsn, null, nowMs, aCw, aCalls);
+      }
+      ancIn += aIn;
+      ancCr += aCr;
+      ancCw += aCw;
+      ancOut += aOut;
+      ancRsn += aRsn;
+      ancCalls += aCalls;
+      ancCost += aCost ?? 0;
+      curPid = String(ar.parent_session_id || '').trim();
+    }
+    return {
+      ancIn,
+      ancCr,
+      ancCw,
+      ancOut,
+      ancRsn,
+      ancCalls,
+      ancCost,
+      ancPrompt: ancIn + ancCr + ancCw,
+    };
+  };
+
+  for (const [, entry] of allByKey.entries()) {
+    const { id, sProf, row: s } = entry;
+    const isAux = Boolean(s._is_aux);
+    const isFocusedActive =
+      !isAux &&
+      liveSidAligned &&
+      activeSet.has(id) &&
+      (!activeProfileSlug || !sProf || sProf === activeProfileSlug);
+
+    const rowBuckets = extractSourceTokenBuckets(s);
+    let sIn = rowBuckets.input ?? 0;
+    let sCr = rowBuckets.cacheRead ?? 0;
+    let sCw = rowBuckets.cacheWrite ?? 0;
+    let sOut = toNum(s.output_tokens ?? s.output ?? s.completion_tokens) ?? 0;
+    let sRsn = toNum(s.reasoning_tokens ?? s.reasoning) ?? 0;
+    let sCalls = pickBestNum(s.api_call_count, s.api_calls, s.calls);
     let sCost = pickBestNum(s.actual_cost_usd, s.cost_usd, s.estimated_cost_usd);
-    let sEst = false;
+    let sEst = String(s.cost_status || '').toLowerCase() === 'estimated';
 
-    if (activeSet.has(id) && liveMerged) {
+    if (isFocusedActive && liveMerged) {
       matchedActive = true;
-      sIn = Math.max(sIn, liveMerged.input ?? 0);
-      sOut = Math.max(sOut, liveMerged.output ?? 0);
-      if (liveMerged.backendCost != null) sCost = Math.max(sCost ?? 0, liveMerged.backendCost);
+      // Hermes runtime `session_*_tokens` accumulate across auto-compression rotations (`parent_session_id`),
+      // whereas `/ledger` includes each persisted ancestor segment separately. Subtract present ancestors
+      // when `liveMerged` carries the full-chain watermark (`livePrompt >= ancPrompt`) so ancestors are never double-billed!
+      const anc = s.parent_session_id ? sumLineageAncestors(s.parent_session_id, sProf) : null;
+      const livePrompt =
+        (liveMerged.input ?? 0) + (liveMerged.cacheRead ?? 0) + (liveMerged.cacheWrite ?? 0);
+      const deductAnc = Boolean(anc && anc.ancPrompt > 0 && livePrompt >= anc.ancPrompt);
+
+      const effLiveIn = deductAnc ? Math.max(0, (liveMerged.input ?? 0) - anc.ancIn) : (liveMerged.input ?? 0);
+      const effLiveCr = deductAnc ? Math.max(0, (liveMerged.cacheRead ?? 0) - anc.ancCr) : (liveMerged.cacheRead ?? 0);
+      const effLiveCw = deductAnc ? Math.max(0, (liveMerged.cacheWrite ?? 0) - anc.ancCw) : (liveMerged.cacheWrite ?? 0);
+      const effLiveOut = deductAnc ? Math.max(0, (liveMerged.output ?? 0) - anc.ancOut) : (liveMerged.output ?? 0);
+      const effLiveRsn = deductAnc ? Math.max(0, (liveMerged.reasoning ?? 0) - anc.ancRsn) : (liveMerged.reasoning ?? 0);
+      const effLiveCalls =
+        liveMerged.calls != null
+          ? (deductAnc ? Math.max(0, liveMerged.calls - anc.ancCalls) : liveMerged.calls)
+          : null;
+      const effLiveCost =
+        liveMerged.backendCost != null
+          ? (deductAnc ? Math.max(0, liveMerged.backendCost - anc.ancCost) : liveMerged.backendCost)
+          : null;
+
+      const liveAdvanced =
+        effLiveIn > sIn ||
+        effLiveCr > sCr ||
+        effLiveCw > sCw ||
+        effLiveOut > sOut;
+      sIn = Math.max(sIn, effLiveIn);
+      sCr = Math.max(sCr, effLiveCr);
+      sCw = Math.max(sCw, effLiveCw);
+      sOut = Math.max(sOut, effLiveOut);
+      sRsn = Math.max(sRsn, effLiveRsn);
+      sCalls = Math.max(sCalls ?? 0, effLiveCalls ?? 0) || sCalls;
+      if (effLiveCost != null) {
+        sCost = Math.max(sCost ?? 0, effLiveCost);
+      } else if (liveAdvanced && sCost != null && !isZeroMarginalCostSource(s, ...liveRouteHints)) {
+        const refreshedEst = estimateRawTokensUsd(
+          sIn,
+          sOut,
+          s.model || liveModelName,
+          sCr,
+          null,
+          sRsn,
+          null,
+          nowMs,
+          sCw,
+          sCalls
+        );
+        if (refreshedEst != null && refreshedEst > sCost) {
+          sCost = refreshedEst;
+          sEst = true;
+        }
+      }
     }
 
-    if (sCost == null && (sIn > 0 || sOut > 0)) {
-      if (isZeroMarginalCostSource(s, ...(activeSet.has(id) ? liveRouteHints : []))) {
+    const effectiveModel = s.model || (isFocusedActive ? liveModelName : '');
+    if (sCost == null && (sIn > 0 || sCr > 0 || sCw > 0 || sOut > 0)) {
+      if (isZeroMarginalCostSource(s, ...(isFocusedActive ? liveRouteHints : []))) {
         sCost = 0;
       } else {
         const est = estimateRawTokensUsd(
           sIn,
           sOut,
-          s.model || liveModelName,
-          toNum(s.cache_read_tokens ?? s.cache_read ?? s.cached_tokens),
+          effectiveModel,
+          sCr,
           null,
-          toNum(s.reasoning_tokens) ?? 0,
+          sRsn,
           null,
-          nowMs
+          nowMs,
+          sCw,
+          sCalls
         );
         if (est != null) {
           sCost = est;
@@ -1792,7 +2183,48 @@ function aggregatePersistedSessions(
       }
     }
 
+    const ledgerKey = `${connScopeKey}:${sProf || activeProfileSlug || 'default'}:${id}`;
+    // Record watermarks BEFORE cutoffMs filtering so dormant older sessions anchor their pre-today baseline immediately!
+    if (sIn > 0 || sCr > 0 || sCw > 0 || sOut > 0 || (sCost ?? 0) > 0) {
+      const snap = {
+        input: sIn,
+        cacheRead: sCr,
+        cacheWrite: sCw,
+        output: sOut,
+        costUsd: sCost,
+      };
+      observations.push({ dayKey: todayDayKey, sessionKey: ledgerKey, snapshot: snap });
+      if (ledger && mutateLedger) {
+        if (recordLedgerObservation(ledger, todayDayKey, ledgerKey, snap)) {
+          ledgerDirty = true;
+        }
+      }
+    }
+
+    const ts =
+      toEpochMs(s.last_active ?? s.last_activity_at ?? s.last_active_at) ??
+      toEpochMs(s.started_at);
+    if (cutoffMs > 0 && (ts == null || ts < cutoffMs)) continue;
+
+    // Cross-day forever-chat delta slicing when a prior-day baseline exists
+    const startedMs = toEpochMs(s.started_at);
+    if (ledger && cutoffMs > 0 && startedMs != null && startedMs < cutoffMs) {
+      const base = lookupLedgerBaseline(ledger, cutoffDayKey, ledgerKey);
+      if (base) {
+        sIn = Math.max(0, sIn - (base.input ?? 0));
+        sCr = Math.max(0, sCr - (base.cacheRead ?? 0));
+        sCw = Math.max(0, sCw - (base.cacheWrite ?? 0));
+        sOut = Math.max(0, sOut - (base.output ?? 0));
+        if (sCost != null && base.costUsd != null) {
+          sCost = Math.max(0, sCost - base.costUsd);
+        }
+      }
+    }
+
+    if (!isAux) sessionCount += 1;
     input += sIn;
+    cacheRead += sCr;
+    cacheWrite += sCw;
     output += sOut;
     if (sCost != null) {
       costUsd += sCost;
@@ -1802,14 +2234,23 @@ function aggregatePersistedSessions(
   }
 
   const primaryActiveId = activeCandidateIds?.[0] || '';
-  if (
+  const includeActiveLiveFallback =
+    aggOpts?.includeActiveLive !== false &&
+    liveSidAligned &&
     primaryActiveId &&
     !matchedActive &&
     liveMerged &&
-    ((liveMerged.input ?? 0) > 0 || (liveMerged.output ?? 0) > 0 || (liveMerged.backendCost ?? 0) > 0)
-  ) {
-    byId.set(primaryActiveId, { id: primaryActiveId });
+    ((liveMerged.input ?? 0) > 0 ||
+      (liveMerged.cacheRead ?? 0) > 0 ||
+      (liveMerged.cacheWrite ?? 0) > 0 ||
+      (liveMerged.output ?? 0) > 0 ||
+      (liveMerged.backendCost ?? 0) > 0);
+
+  if (includeActiveLiveFallback) {
+    sessionCount += 1;
     input += liveMerged.input ?? 0;
+    cacheRead += liveMerged.cacheRead ?? 0;
+    cacheWrite += liveMerged.cacheWrite ?? 0;
     output += liveMerged.output ?? 0;
     const liveCost = estimateSessionCost(liveMerged, liveModelName, ...liveRouteHints);
     if (liveCost.amount != null) {
@@ -1819,13 +2260,19 @@ function aggregatePersistedSessions(
     }
   }
 
+  const promptTokens = input + cacheRead + cacheWrite;
   return {
     input,
+    cacheRead,
+    cacheWrite,
+    promptTokens,
     output,
-    total: input + output,
-    sessionCount: byId.size,
+    total: promptTokens + output,
+    sessionCount,
     costUsd: hasAnyCost ? costUsd : null,
     estimated: anyEstimated,
+    ledgerDirty,
+    observations,
   };
 }
 
@@ -1851,46 +2298,541 @@ function normalizeCategories(breakdown, skin, t) {
     }));
 }
 
-function resolveRoute(owner, profileSlug) {
+function isLocalRouteMode(obj) {
+  const mode = String(obj?.mode || obj?.connectionKind || '').trim().toLowerCase();
+  if (mode === 'local') return true;
+  if (mode === 'remote') return false;
+  const cid = String(obj?.connectionId || '').trim();
+  return !cid || cid === 'local';
+}
+
+function resolveRoute(owner, profileSlug, routeMap = null) {
   const profile = String(owner?.profile || profileSlug || 'default').trim() || 'default';
   const connId = String(owner?.connectionId || '').trim();
+  if (routeMap && typeof routeMap === 'object') {
+    const cached = routeMap[profile];
+    if (cached && cached.connectionId && cached.profile && cached.targetProfile) {
+      if (!connId || connId === cached.connectionId || (connId === 'local' && cached.mode === 'local')) {
+        return cached;
+      }
+    }
+  }
   if (connId) {
     return {
       connectionId: connId,
-      mode: connId === 'local' ? 'local' : 'remote',
+      mode: isLocalRouteMode(owner) ? 'local' : 'remote',
       profile,
-      targetProfile: profile,
+      targetProfile: String(owner?.targetProfile || profile),
     };
-  }
-  if (typeof host?.profileRoutes === 'function') {
-    try {
-      const routes = host.profileRoutes();
-      if (Array.isArray(routes)) {
-        const match = routes.find((r) => r?.profile === profile || r?.targetProfile === profile);
-        if (match && match.connectionId && match.profile && match.targetProfile) {
-          return {
-            connectionId: String(match.connectionId),
-            mode: match.mode || (match.connectionId === 'local' ? 'local' : 'remote'),
-            profile: String(match.profile),
-            targetProfile: String(match.targetProfile),
-          };
-        }
-      }
-    } catch {}
   }
   return null;
 }
 
-async function gwCall(route, method, params = {}) {
-  if (route && typeof host.requestProfile === 'function') {
-    try {
-      return await host.requestProfile(route, method, params);
-    } catch {}
+async function loadAsyncRouteMap(connFilter = '', hostObj = host) {
+  if (typeof hostObj?.profileRoutes !== 'function') return {};
+  try {
+    const routes = await Promise.resolve(hostObj.profileRoutes());
+    if (!Array.isArray(routes)) return {};
+    const map = {};
+    for (const r of routes) {
+      if (!r || !r.connectionId || !r.profile || !r.targetProfile) continue;
+      const cid = String(r.connectionId).trim();
+      const mode = isLocalRouteMode(r) ? 'local' : 'remote';
+      if (connFilter && connFilter !== 'local' && cid !== connFilter) continue;
+      if (connFilter === 'local' && mode !== 'local') continue;
+      const norm = {
+        connectionId: cid,
+        mode,
+        profile: String(r.profile).trim(),
+        targetProfile: String(r.targetProfile).trim(),
+      };
+      map[norm.profile] = norm;
+      map[norm.targetProfile] = norm;
+    }
+    return map;
+  } catch {
+    return {};
   }
-  if (typeof host.request === 'function') {
-    return host.request(method, params);
+}
+
+async function gwCall(route, method, params = {}, profileHint = '', hostObj = host) {
+  const targetProf = String(route?.targetProfile || route?.profile || profileHint || '').trim();
+  const activeProf = String(hostObj?.state?.profile?.get?.() || 'default').trim();
+  const activeConn = String(
+    hostObj?.state?.connectionId?.get?.() ||
+      (typeof hostObj?.activeConnectionId === 'function' ? hostObj.activeConnectionId() : '') ||
+      ''
+  ).trim();
+
+  const canFallbackToActiveSocket = (err) => {
+    // Never replay a request that already reached the target gateway and received a JSON-RPC error code
+    if (typeof err?.code === 'number') return false;
+    if (targetProf && targetProf !== activeProf) return false;
+    const rConn = String(route?.connectionId || '').trim();
+    if (rConn) {
+      const sameLocal = (rConn === 'local' || route?.mode === 'local') && (!activeConn || activeConn === 'local');
+      if (!sameLocal && rConn !== activeConn) return false;
+    }
+    return true;
+  };
+
+  if (typeof hostObj?.requestProfile === 'function') {
+    if (route) {
+      try {
+        return await hostObj.requestProfile(route, method, params);
+      } catch (err) {
+        if (!canFallbackToActiveSocket(err)) throw err;
+      }
+    } else if (targetProf) {
+      try {
+        return await hostObj.requestProfile(targetProf, method, params);
+      } catch (err) {
+        if (!canFallbackToActiveSocket(err)) throw err;
+      }
+    }
+  }
+  if (typeof hostObj?.request === 'function') {
+    if (!canFallbackToActiveSocket(null)) {
+      throw new Error(`Cannot route ${method} for "${targetProf || 'default'}" without requestProfile`);
+    }
+    return hostObj.request(method, params);
   }
   throw new Error('Hermes gateway unavailable');
+}
+
+function synthesizeCanonicalSessionRow(sessionId, profileName, payload, canonicalMeta = null, profileMeta = null) {
+  if (!sessionId || !payload || typeof payload !== 'object') return null;
+  const usageObj = payload.usage && typeof payload.usage === 'object' ? payload.usage : payload;
+  const buckets = extractSourceTokenBuckets(usageObj);
+  const output = pickBestNum(
+    usageObj.output,
+    usageObj.output_tokens,
+    usageObj.completion,
+    usageObj.completion_tokens,
+    payload.output_tokens
+  ) ?? 0;
+  const reasoning = pickBestNum(
+    usageObj.reasoning,
+    usageObj.reasoning_tokens,
+    payload.reasoning_tokens
+  ) ?? 0;
+  const model = String(
+    usageObj.model || payload.model || profileMeta?.model || ''
+  ).trim();
+  const provider = String(
+    usageObj.provider || payload.provider || profileMeta?.provider || ''
+  ).trim();
+  const startedAt =
+    payload.started_at ?? canonicalMeta?.started_at ?? null;
+  const lastActive =
+    payload.last_active_at ??
+    payload.last_activity_at ??
+    payload.last_active ??
+    canonicalMeta?.last_active ??
+    startedAt;
+  const directCost = pickBestNum(
+    usageObj.actual_cost_usd,
+    usageObj.cost_usd,
+    usageObj.estimated_cost_usd,
+    payload.actual_cost_usd,
+    payload.cost_usd,
+    payload.estimated_cost_usd
+  );
+
+  return {
+    id: String(sessionId),
+    _profile: String(profileName),
+    profile: String(profileName),
+    source: String(payload.source || 'local'),
+    hidden: true,
+    title: String(payload.title || canonicalMeta?.title || 'Bot Chat'),
+    model,
+    provider,
+    billing_provider: provider,
+    started_at: startedAt,
+    last_active: lastActive,
+    api_call_count: pickBestNum(usageObj.calls, usageObj.api_calls, payload.api_call_count) ?? 0,
+    input_tokens: buckets.input ?? 0,
+    cache_read_tokens: buckets.cacheRead ?? 0,
+    cache_write_tokens: buckets.cacheWrite ?? 0,
+    output_tokens: output,
+    reasoning_tokens: reasoning,
+    ...(directCost != null ? { estimated_cost_usd: directCost, cost_status: 'estimated' } : {}),
+  };
+}
+
+async function fetchBackendLedger(ctx) {
+  if (typeof ctx?.rest !== 'function') return null;
+  try {
+    const res = await ctx.rest('/ledger');
+    if (!res || typeof res !== 'object' || !Array.isArray(res.entries)) return null;
+    const names = [];
+    const titles = {};
+    const metaByProfile = {};
+    if (Array.isArray(res.profiles)) {
+      for (const p of res.profiles) {
+        if (!p || typeof p !== 'object') continue;
+        const name = String(p.name || '').trim();
+        if (!name) continue;
+        names.push(name);
+        if (p.title) titles[name] = String(p.title).trim();
+        if (p.model || p.provider || p.base_url) {
+          metaByProfile[name] = {
+            model: String(p.model || '').trim(),
+            provider: String(p.provider || '').trim(),
+            base_url: String(p.base_url || '').trim(),
+          };
+        }
+      }
+    }
+    return {
+      names: Array.from(new Set(names)).sort(),
+      titles,
+      metaByProfile,
+      entries: res.entries,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function discoverConnectionRoster({
+  effectiveConnId = '',
+  routeMap = null,
+  gwCallFn = gwCall,
+  hostObj = host,
+} = {}) {
+  const namesSet = new Set();
+  const titles = {};
+  const canonicalByProfile = {};
+  const metaByProfile = {};
+  const routes = {};
+
+  let primaryConnId =
+    typeof hostObj?.primaryConnectionId === 'function'
+      ? String(hostObj.primaryConnectionId() || '').trim()
+      : '';
+
+  const matchesConn = (item) => {
+    const cid = String(item?.connectionId || '').trim();
+    if (effectiveConnId && effectiveConnId !== 'local') {
+      return cid === effectiveConnId;
+    }
+    return !cid || cid === 'local' || isLocalRouteMode(item) || (primaryConnId && cid === primaryConnId);
+  };
+
+  const ingestProfileRow = (p, isAgentRoster = false) => {
+    if (!p || typeof p !== 'object') return;
+    if (isAgentRoster && p.connectionId !== undefined && !matchesConn(p)) return;
+    const rawName = String(p.targetProfile || p.profile || p.name || '').trim();
+    if (!rawName) return;
+    namesSet.add(rawName);
+    if (isAgentRoster && p.connectionId) {
+      const rNorm = {
+        connectionId: String(p.connectionId).trim(),
+        mode: isLocalRouteMode(p) ? 'local' : 'remote',
+        profile: String(p.profile || rawName).trim(),
+        targetProfile: rawName,
+      };
+      routes[rNorm.profile] = rNorm;
+      routes[rNorm.targetProfile] = rNorm;
+    }
+    const title = String(
+      p.ui_meta?.['hermes-bots']?.title || p.bot_title || p.displayName || p.display_name || ''
+    ).trim();
+    if (title) titles[rawName] = title;
+    if (p.model || p.provider) {
+      metaByProfile[rawName] = {
+        model: String(p.model || metaByProfile[rawName]?.model || '').trim(),
+        provider: String(p.provider || metaByProfile[rawName]?.provider || '').trim(),
+      };
+    }
+    const canon = p.canonical_session;
+    if (canon && typeof canon === 'object' && (canon.id || canon.resolved_id)) {
+      canonicalByProfile[rawName] = canon;
+    }
+  };
+
+  const tasks = [];
+
+  if (typeof hostObj?.agents === 'function') {
+    tasks.push(
+      Promise.resolve()
+        .then(() => hostObj.agents())
+        .then((res) => {
+          if (typeof res?.primaryConnectionId === 'string' && res.primaryConnectionId.trim()) {
+            primaryConnId = res.primaryConnectionId.trim();
+          }
+          const list = Array.isArray(res?.agents) ? res.agents : Array.isArray(res) ? res : [];
+          for (const item of list) ingestProfileRow(item, true);
+        })
+        .catch(() => {})
+    );
+  }
+
+  // Always query `profiles.list` against `default` (the launch root) rather than an isolated
+  // secondary profile whose `scope_to_launch_profile` filter only returns itself!
+  const defaultRoute = resolveRoute(
+    { connectionId: effectiveConnId, profile: 'default' },
+    'default',
+    { ...(routeMap || {}), ...routes }
+  );
+  tasks.push(
+    Promise.resolve()
+      .then(() => gwCallFn(defaultRoute, 'profiles.list', { include_sessions: true }, 'default'))
+      .then((res) => {
+        if (Array.isArray(res?.profiles)) {
+          for (const p of res.profiles) ingestProfileRow(p, false);
+        }
+      })
+      .catch(() => {})
+  );
+
+  if (!effectiveConnId || effectiveConnId === 'local') {
+    if (typeof hostObj?.profiles?.list === 'function') {
+      tasks.push(
+        Promise.resolve()
+          .then(() => hostObj.profiles.list())
+          .then((res) => {
+            const list = Array.isArray(res?.profiles) ? res.profiles : Array.isArray(res) ? res : [];
+            for (const p of list) ingestProfileRow(p, false);
+          })
+          .catch(() => {})
+      );
+    }
+  }
+
+  await Promise.all(tasks);
+  return {
+    names: Array.from(namesSet).sort(),
+    titles,
+    canonicalByProfile,
+    metaByProfile,
+    routes,
+  };
+}
+
+function keepHigherSessionWatermark(prevRow, nextRow) {
+  if (!prevRow || typeof prevRow !== 'object') return nextRow;
+  if (!nextRow || typeof nextRow !== 'object') return prevRow;
+  const prevTok =
+    (prevRow.input_tokens ?? 0) + (prevRow.cache_read_tokens ?? 0) + (prevRow.output_tokens ?? 0);
+  const nextTok =
+    (nextRow.input_tokens ?? 0) + (nextRow.cache_read_tokens ?? 0) + (nextRow.output_tokens ?? 0);
+  return nextTok >= prevTok ? nextRow : prevRow;
+}
+
+async function collectProfileSessionsForScope({
+  targetProfiles,
+  connScopeKey = 'local',
+  effectiveConnId = '',
+  routeMap = null,
+  canonicalByProfile = {},
+  metaByProfile = {},
+  botChatCache = null,
+  activeIds = [],
+  forceRefresh = false,
+  gwCallFn = gwCall,
+  hostObj = host,
+}) {
+  const activeIdSet = new Set((activeIds || []).filter(Boolean));
+  const groupSessionIdsByProfile = {};
+  const groupTitlesByProfile = {};
+  try {
+    const defaultRoute = resolveRoute({ connectionId: effectiveConnId, profile: 'default' }, 'default', routeMap);
+    const groupsRes = await gwCallFn(defaultRoute, 'groups.list', {}, 'default');
+    const rooms = Array.isArray(groupsRes?.rooms)
+      ? groupsRes.rooms
+      : Array.isArray(groupsRes?.groups)
+        ? groupsRes.groups
+        : Array.isArray(groupsRes)
+          ? groupsRes
+          : [];
+    for (const g of rooms) {
+      if (!g || typeof g !== 'object') continue;
+      const roomId = String(g.id || g.room_id || '').trim();
+      const members = Array.isArray(g.members) ? g.members : [];
+      for (const m of members) {
+        const mProf = String(m?.profile || m?.agent || '').trim();
+        if (!mProf) continue;
+        const mSid = String(m?.session_id || m?.sessionId || g.session_id || '').trim();
+        if (mSid) {
+          if (!groupSessionIdsByProfile[mProf]) groupSessionIdsByProfile[mProf] = [];
+          groupSessionIdsByProfile[mProf].push(mSid);
+        } else if (roomId) {
+          if (!groupTitlesByProfile[mProf]) groupTitlesByProfile[mProf] = [];
+          groupTitlesByProfile[mProf].push(`Group: ${roomId}`);
+        }
+      }
+    }
+  } catch {}
+
+  const batches = await Promise.all(
+    (targetProfiles || []).map(async (pName) => {
+      const route = resolveRoute({ connectionId: effectiveConnId, profile: pName }, pName, routeMap);
+      let persisted = [];
+      const childParentMap = new Map();
+      const extraSegmentIds = [];
+
+      if (typeof hostObj?.listPersistedSessions === 'function') {
+        try {
+          const res = await hostObj.listPersistedSessions(route, { profile: pName, limit: 500 });
+          if (Array.isArray(res?.sessions)) {
+            persisted = res.sessions.map((s) => {
+              if (!s || typeof s !== 'object') return s;
+              const lineageIds = Array.isArray(s._lineage_ids)
+                ? s._lineage_ids.map((x) => String(x || '').trim()).filter(Boolean)
+                : [];
+              const trueRootId = String(s._lineage_root_id || lineageIds[0] || '').trim();
+              // `project_compression_tips` keeps `root`'s token/cost counters while stamping `tip`'s `id`.
+              // Restore `id` to `trueRootId` so the root row represents the root segment accurately,
+              // then queue subsequent segments (`lineageIds[1..last]`) with `parent_session_id` links!
+              if (trueRootId && lineageIds.length > 1) {
+                for (let idx = 1; idx < lineageIds.length; idx++) {
+                  const childId = lineageIds[idx];
+                  const prevId = lineageIds[idx - 1];
+                  if (childId && childId !== trueRootId) {
+                    childParentMap.set(childId, prevId);
+                    extraSegmentIds.push(childId);
+                  }
+                }
+                if (s.id !== trueRootId) {
+                  return {
+                    ...s,
+                    id: trueRootId,
+                    end_reason: 'compression',
+                    _folded_tip_id: String(s.id || ''),
+                    _profile: pName,
+                  };
+                }
+              }
+              return { ...s, _profile: pName };
+            });
+          }
+        } catch {}
+      }
+
+      const existingIds = new Set();
+      for (const s of persisted) {
+        if (!s || typeof s !== 'object') continue;
+        const sid = String(s.id || s.session_id || '');
+        if (sid) existingIds.add(sid);
+      }
+
+      const missingLineageChildren = Array.from(new Set(extraSegmentIds)).filter((id) => !existingIds.has(id));
+
+      // Hidden canonical "Bot Chat" rows and group bot_room sessions are excluded by `listPersistedSessions` (`s.hidden = 0`).
+      let canon = canonicalByProfile?.[pName] || null;
+      if (!canon || (!canon.id && !canon.resolved_id)) {
+        try {
+          const byTitle = await gwCallFn(
+            route,
+            'session.list',
+            { title: 'Bot Chat', include_hidden: true },
+            pName
+          );
+          const first = Array.isArray(byTitle?.sessions) ? byTitle.sessions[0] : null;
+          if (first && (first.id || first.resolved_id)) {
+            canon = first;
+          }
+        } catch {}
+      }
+
+      const discoveredGroupIds = [...(groupSessionIdsByProfile[pName] || [])];
+      for (const gTitle of groupTitlesByProfile[pName] || []) {
+        try {
+          const gRes = await gwCallFn(route, 'session.list', { title: gTitle, include_hidden: true }, pName);
+          if (Array.isArray(gRes?.sessions)) {
+            for (const gs of gRes.sessions) {
+              const gsid = String(gs?.id || gs?.resolved_id || '').trim();
+              if (gsid) discoveredGroupIds.push(gsid);
+            }
+          }
+        } catch {}
+      }
+
+      const hiddenCandidates = Array.from(
+        new Set(
+          [
+            canon?.id,
+            canon?.resolved_id,
+            ...discoveredGroupIds,
+            ...missingLineageChildren,
+          ]
+            .filter((x) => typeof x === 'string' && x.trim())
+            .map((x) => x.trim())
+        )
+      );
+
+      for (const cid of hiddenCandidates) {
+        if (existingIds.has(cid)) continue;
+        const cacheKey = `${connScopeKey}:${pName}:${cid}`;
+        const cachedEntry = botChatCache?.get?.(cacheKey);
+        const isCanon = cid === canon?.id || cid === canon?.resolved_id;
+        const canonStamp = isCanon ? toEpochMs(canon?.last_active ?? canon?.started_at) : null;
+        if (
+          !forceRefresh &&
+          !activeIdSet.has(cid) &&
+          cachedEntry &&
+          cachedEntry.row &&
+          (canonStamp == null || cachedEntry.canonStamp === canonStamp)
+        ) {
+          persisted.push(cachedEntry.row);
+          existingIds.add(cid);
+          continue;
+        }
+
+        let payload = null;
+        for (const method of ['session.info', 'session.stats', 'session.usage']) {
+          try {
+            const r = await gwCallFn(route, method, { session_id: cid }, pName);
+            if (r && typeof r === 'object') {
+              const u = r.usage && typeof r.usage === 'object' ? r.usage : r;
+              const hasAny =
+                toNum(u.input ?? u.input_tokens ?? u.prompt ?? u.prompt_tokens) != null ||
+                toNum(u.output ?? u.output_tokens) != null ||
+                method === 'session.usage';
+              if (hasAny) {
+                payload = r;
+                break;
+              }
+            }
+          } catch {}
+        }
+
+        if (payload) {
+          const synth = synthesizeCanonicalSessionRow(
+            cid,
+            pName,
+            payload,
+            isCanon ? canon : null,
+            metaByProfile?.[pName]
+          );
+          if (synth) {
+            if (childParentMap.has(cid)) {
+              synth.parent_session_id = childParentMap.get(cid);
+            }
+            if (missingLineageChildren.includes(cid) && Array.from(childParentMap.values()).includes(cid)) {
+              synth.end_reason = 'compression';
+            }
+            const guarded = keepHigherSessionWatermark(cachedEntry?.row, synth);
+            persisted.push(guarded);
+            existingIds.add(cid);
+            if (botChatCache?.set) {
+              botChatCache.set(cacheKey, { canonStamp, row: guarded });
+            }
+          }
+        } else if (cachedEntry?.row) {
+          persisted.push(cachedEntry.row);
+          existingIds.add(cid);
+        }
+      }
+
+      return persisted;
+    })
+  );
+
+  return batches.flat();
 }
 
 function resolveToneLevel(usedRatio, triggerRatio) {
@@ -2472,15 +3414,28 @@ function ContextBarChip({ ctx }) {
   const focusedProfile = useValue(host.state.focusedSessionProfile);
   const activeProfile = useValue(host.state.profile);
   const focusedOwner = useValue(host.state.focusedSessionOwner);
+  const stateConnId = useValue(host.state.connectionId);
   const busy = useValue(host.state.busy);
 
-  const candidateIds = [focusedSessionId, activeSessionId, focusedStoredSessionId].filter(
+  // Only fall back to main-pane `activeSessionId` when neither `focusedSessionId` nor `focusedStoredSessionId` is set
+  // (prevents a cold split-pane tile from borrowing the main pane's session ID across profiles!).
+  const runtimeSid = focusedSessionId || (!focusedStoredSessionId ? activeSessionId : null);
+  const candidateIds = [runtimeSid, focusedStoredSessionId].filter(
     (v, i, arr) => typeof v === 'string' && v.trim() && arr.indexOf(v) === i
   );
   const sessionId = candidateIds[0] || '';
   const profileSlug =
     String(focusedProfile || activeProfile || focusedOwner?.profile || 'default').trim() || 'default';
   const ownerConnId = String(focusedOwner?.connectionId || '').trim();
+  const activeHostConnId =
+    typeof host?.activeConnectionId === 'function' ? String(host.activeConnectionId() || '').trim() : '';
+  const windowConnId = String(stateConnId || '').trim() || activeHostConnId;
+  const effectiveConnId = ownerConnId || windowConnId;
+  const connScopeKey = effectiveConnId || 'local';
+  const isWindowPrimaryConn =
+    !ownerConnId ||
+    ownerConnId === windowConnId ||
+    ((!windowConnId || windowConnId === 'local') && (ownerConnId === 'local' || isLocalRouteMode(focusedOwner)));
 
   const [prefs, setPrefs] = React.useState(() => loadPrefs(ctx));
   const lang = resolveLang(prefs.language, ctx);
@@ -2511,16 +3466,33 @@ function ContextBarChip({ ctx }) {
   });
   const [profileRouteHint, setProfileRouteHint] = React.useState(null);
 
-  const [botTitles, setBotTitles] = React.useState({});
-  const [profileNames, setProfileNames] = React.useState([]);
+  const [routeMapByConn, setRouteMapByConn] = React.useState({});
+  const [botTitlesByConn, setBotTitlesByConn] = React.useState({});
+  const [profileNamesByConn, setProfileNamesByConn] = React.useState({});
+  const [canonicalByConn, setCanonicalByConn] = React.useState({});
+  const [metaByConn, setMetaByConn] = React.useState({});
   const [refreshNonce, setRefreshNonce] = React.useState(0);
   const [compactState, setCompactState] = React.useState('idle');
   const [compactMsg, setCompactMsg] = React.useState('');
   const [streamSpeed, setStreamSpeed] = React.useState({ tps: null, active: false });
 
+  const routeMap = routeMapByConn[connScopeKey] || null;
+  const botTitles = botTitlesByConn[connScopeKey] || {};
+  const profileNames = profileNamesByConn[connScopeKey] || [];
+  const canonicalByProfile = canonicalByConn[connScopeKey] || {};
+  const metaByProfile = metaByConn[connScopeKey] || {};
+
   const closeTimerRef = React.useRef(null);
+  const compactTimerRef = React.useRef(null);
   const policyReqRef = React.useRef(0);
   const prevBusyRef = React.useRef(Boolean(busy));
+  const botChatCacheRef = React.useRef(new Map());
+  const ledgerApiCacheRef = React.useRef(new Map());
+  const ledgerRef = React.useRef(null);
+  if (ledgerRef.current === null) {
+    ledgerRef.current = loadUsageLedger(ctx);
+  }
+  const lastForceRefreshRef = React.useRef(0);
   const streamRef = React.useRef({
     active: false,
     firstTokenAt: 0,
@@ -2560,52 +3532,101 @@ function ContextBarChip({ ctx }) {
   React.useEffect(
     () => () => {
       cancelClose();
+      if (compactTimerRef.current !== null) {
+        globalThis.clearTimeout(compactTimerRef.current);
+        compactTimerRef.current = null;
+      }
     },
     [cancelClose]
   );
 
-  // 1. Load bot profiles & display names
+  // 0. Resolve async SDK profileRoutes once per connection / refresh
   React.useEffect(() => {
     let cancelled = false;
-    const route = resolveRoute({ connectionId: ownerConnId, profile: profileSlug }, profileSlug);
-    gwCall(route, 'profiles.list', { include_sessions: false })
-      .then((res) => {
-        if (cancelled || !Array.isArray(res?.profiles)) return;
-        const nextTitles = {};
-        const names = [];
-        for (const p of res.profiles) {
-          const name = String(p?.name || '').trim();
-          if (!name) continue;
-          names.push(name);
-          const title = String(p?.ui_meta?.['hermes-bots']?.title || p?.display_name || '').trim();
-          if (title) nextTitles[name] = title;
-        }
-        if (Object.keys(nextTitles).length > 0) setBotTitles((prev) => ({ ...prev, ...nextTitles }));
-        if (names.length > 0) {
-          setProfileNames((prev) => (prev.join(',') === names.join(',') ? prev : names));
-        }
-      })
-      .catch(() => {});
+    loadAsyncRouteMap(effectiveConnId).then((loaded) => {
+      if (cancelled || !loaded || Object.keys(loaded).length === 0) return;
+      setRouteMapByConn((prev) => ({
+        ...prev,
+        [connScopeKey]: { ...(prev[connScopeKey] || {}), ...loaded },
+      }));
+    });
     return () => {
       cancelled = true;
     };
-  }, [ownerConnId, profileSlug]);
+  }, [connScopeKey, effectiveConnId, refreshNonce]);
+
+  // 1. Load full connection roster & canonical Bot Chat pointers (monotonically merged per connection
+  // so switching into an isolated secondary bot never shrinks `profileNames` down to 1!)
+  React.useEffect(() => {
+    let cancelled = false;
+    discoverConnectionRoster({ effectiveConnId, routeMap }).then((discovered) => {
+      if (cancelled) return;
+      if (discovered.routes && Object.keys(discovered.routes).length > 0) {
+        setRouteMapByConn((prev) => {
+          const cur = prev[connScopeKey] || {};
+          const next = { ...cur, ...discovered.routes };
+          const keys = Object.keys(next);
+          if (
+            keys.length === Object.keys(cur).length &&
+            keys.every(
+              (k) =>
+                cur[k]?.connectionId === next[k]?.connectionId &&
+                cur[k]?.mode === next[k]?.mode &&
+                cur[k]?.profile === next[k]?.profile &&
+                cur[k]?.targetProfile === next[k]?.targetProfile
+            )
+          ) {
+            return prev;
+          }
+          return { ...prev, [connScopeKey]: next };
+        });
+      }
+      if (Object.keys(discovered.titles).length > 0) {
+        setBotTitlesByConn((prev) => ({
+          ...prev,
+          [connScopeKey]: { ...(prev[connScopeKey] || {}), ...discovered.titles },
+        }));
+      }
+      if (Object.keys(discovered.canonicalByProfile).length > 0) {
+        setCanonicalByConn((prev) => ({
+          ...prev,
+          [connScopeKey]: { ...(prev[connScopeKey] || {}), ...discovered.canonicalByProfile },
+        }));
+      }
+      if (Object.keys(discovered.metaByProfile).length > 0) {
+        setMetaByConn((prev) => ({
+          ...prev,
+          [connScopeKey]: { ...(prev[connScopeKey] || {}), ...discovered.metaByProfile },
+        }));
+      }
+      setProfileNamesByConn((prev) => {
+        const cur = prev[connScopeKey] || [];
+        const mergedSet = new Set([...cur, ...discovered.names, profileSlug].filter(Boolean));
+        const nextList = Array.from(mergedSet).sort();
+        if (nextList.join(',') === cur.join(',')) return prev;
+        return { ...prev, [connScopeKey]: nextList };
+      });
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [connScopeKey, effectiveConnId, profileSlug, routeMap, refreshNonce]);
 
   // 2. Load official Hermes context/compression/memory config read-only via Plugin SDK (race-guarded on bot switch)
   const loadOfficialPolicy = React.useCallback(async () => {
     const reqId = ++policyReqRef.current;
-    const route = resolveRoute({ connectionId: ownerConnId, profile: profileSlug }, profileSlug);
-    const result = await readPolicyViaSdk(route, profileSlug);
+    const route = resolveRoute({ connectionId: effectiveConnId, profile: profileSlug }, profileSlug, routeMap);
+    const result = await readPolicyViaSdk(route, profileSlug, (r, m, p) => gwCall(r, m, p, profileSlug));
     if (reqId !== policyReqRef.current) return;
     setPolicy(result.policy);
-    setProfileRouteHint(result.routeHint);
-  }, [ownerConnId, profileSlug]);
+    setProfileRouteHint({ ...result.routeHint, _profile: profileSlug });
+  }, [effectiveConnId, profileSlug, routeMap]);
 
   React.useEffect(() => {
     loadOfficialPolicy();
-  }, [ownerConnId, profileSlug, loadOfficialPolicy, refreshNonce]);
+  }, [effectiveConnId, profileSlug, loadOfficialPolicy, refreshNonce]);
 
-  // 3. Fetch focused session context_breakdown + usage + persisted backfill
+  // 3. Fetch focused session context_breakdown + usage + persisted / canonical backfill
   const candidateIdsKey = candidateIds.join('|');
   React.useEffect(() => {
     const ids = candidateIdsKey ? candidateIdsKey.split('|') : [];
@@ -2619,7 +3640,7 @@ function ContextBarChip({ ctx }) {
 
     let cancelled = false;
     let retryTimer = null;
-    const route = resolveRoute({ connectionId: ownerConnId, profile: profileSlug }, profileSlug);
+    const route = resolveRoute({ connectionId: effectiveConnId, profile: profileSlug }, profileSlug, routeMap);
 
     const fetchAll = async (attempt = 0) => {
       if (cancelled) return;
@@ -2633,11 +3654,30 @@ function ContextBarChip({ ctx }) {
               .listPersistedSessions(route, { profile: profileSlug, limit: 200 })
               .then((res) => {
                 const list = Array.isArray(res?.sessions) ? res.sessions : [];
-                return (
+                const found =
                   list.find((s) => ids.includes(String(s?.id || ''))) ||
                   list.find((s) => ids.includes(String(s?.session_id || ''))) ||
-                  null
-                );
+                  null;
+                // If `project_compression_tips` projected root counters onto a rotated tip ID, strip root counters
+                // so single-session mode uses the live full-chain totals rather than a stale root-only cost!
+                if (
+                  found &&
+                  Array.isArray(found._lineage_ids) &&
+                  found._lineage_ids.length > 1 &&
+                  found._lineage_root_id &&
+                  found.id !== found._lineage_root_id
+                ) {
+                  return {
+                    id: found.id,
+                    model: found.model,
+                    billing_provider: found.billing_provider,
+                    billing_base_url: found.billing_base_url,
+                    billing_mode: found.billing_mode,
+                    cost_status: found.cost_status,
+                    compression_count: found.compression_count,
+                  };
+                }
+                return found;
               })
               .catch(() => null)
           : Promise.resolve(null);
@@ -2645,7 +3685,7 @@ function ContextBarChip({ ctx }) {
       for (const sid of ids) {
         if (!gotBreakdown) {
           try {
-            const bd = await gwCall(route, 'session.context_breakdown', { session_id: sid });
+            const bd = await gwCall(route, 'session.context_breakdown', { session_id: sid }, profileSlug);
             if (bd && (toNum(bd.context_max) > 0 || (Array.isArray(bd.categories) && bd.categories.length > 0))) {
               gotBreakdown = bd;
             }
@@ -2653,21 +3693,27 @@ function ContextBarChip({ ctx }) {
         }
         if (!gotUsage) {
           let u = null;
-          try {
-            u = await gwCall(route, 'session.usage', { session_id: sid });
-          } catch {
+          for (const method of ['session.usage', 'session.stats', 'session.info']) {
             try {
-              u = await gwCall(route, 'session.stats', { session_id: sid });
+              const raw = await gwCall(route, method, { session_id: sid }, profileSlug);
+              const unwrapped = method === 'session.info' && raw?.usage ? raw.usage : raw;
+              if (unwrapped && typeof unwrapped === 'object') {
+                const hasData =
+                  (toNum(unwrapped.total) ?? toNum(unwrapped.total_tokens) ?? 0) > 0 ||
+                  (toNum(unwrapped.input) ?? toNum(unwrapped.input_tokens) ?? toNum(unwrapped.prompt) ?? 0) > 0 ||
+                  (toNum(unwrapped.context_max) ?? 0) > 0 ||
+                  (toNum(unwrapped.calls) ?? toNum(unwrapped.api_calls) ?? 0) > 0;
+                if (hasData) {
+                  u = unwrapped;
+                  break;
+                }
+                if (!u && sid === ids[ids.length - 1]) {
+                  u = unwrapped;
+                }
+              }
             } catch {}
           }
-          if (u && typeof u === 'object') {
-            const hasData =
-              (toNum(u.total) ?? toNum(u.total_tokens) ?? 0) > 0 ||
-              (toNum(u.input) ?? toNum(u.input_tokens) ?? 0) > 0 ||
-              (toNum(u.context_max) ?? 0) > 0 ||
-              (toNum(u.calls) ?? toNum(u.api_calls) ?? 0) > 0;
-            if (hasData || sid === ids[ids.length - 1]) gotUsage = u;
-          }
+          if (u) gotUsage = u;
         }
         if (gotBreakdown && gotUsage) break;
       }
@@ -2696,11 +3742,14 @@ function ContextBarChip({ ctx }) {
       cancelled = true;
       if (retryTimer !== null) globalThis.clearTimeout(retryTimer);
     };
-  }, [sessionId, candidateIdsKey, ownerConnId, profileSlug, refreshNonce]);
+  }, [sessionId, candidateIdsKey, effectiveConnId, profileSlug, routeMap, refreshNonce]);
 
-  // 4. Fetch multi-session / multi-profile persisted sessions ONLY when needed
+  // 4. Fetch multi-session / multi-profile spend ledger:
+  // Primary engine: authoritative read-only SQLite `/ledger` via official `ctx.rest('/ledger')`.
+  // Automatic fallback: pure SDK `collectProfileSessionsForScope` when backend plugin API is absent/404.
+  const profileNamesKey = profileNames.join(',');
   React.useEffect(() => {
-    if (prefs.usageScope === 'session' || typeof host.listPersistedSessions !== 'function') {
+    if (prefs.usageScope === 'session') {
       setScopedSessions([]);
       setScopeLoading(false);
       return;
@@ -2710,27 +3759,97 @@ function ContextBarChip({ ctx }) {
     setScopeLoading(true);
     const targetProfiles =
       prefs.usageScope === 'all'
-        ? Array.from(new Set([...(profileNames.length > 0 ? profileNames : []), profileSlug]))
+        ? Array.from(new Set([...(profileNames.length > 0 ? profileNames : ['default']), profileSlug]))
         : [profileSlug];
+    const forceRefresh = refreshNonce !== lastForceRefreshRef.current;
+    lastForceRefreshRef.current = refreshNonce;
+    const activeIds = candidateIdsKey ? candidateIdsKey.split('|') : [];
 
-    Promise.all(
-      targetProfiles.map((pName) => {
-        const route = resolveRoute({ connectionId: ownerConnId, profile: pName }, pName);
-        return host
-          .listPersistedSessions(route, { profile: pName, limit: 500 })
-          .then((res) => (Array.isArray(res?.sessions) ? res.sessions : []))
-          .catch(() => []);
-      })
-    ).then((batches) => {
+    const sliceEntriesForScope = (entries) =>
+      prefs.usageScope === 'all'
+        ? entries
+        : entries.filter((e) => String(e?._profile || e?.profile || '') === profileSlug);
+
+    (async () => {
+      // `ctx.rest` is bound to the window's primary connection; only query `/ledger` when the focused pane belongs to it!
+      const apiLedger = isWindowPrimaryConn ? await fetchBackendLedger(ctx) : null;
       if (cancelled) return;
-      setScopedSessions(batches.flat());
+      if (apiLedger) {
+        ledgerApiCacheRef.current.set(connScopeKey, {
+          fetchedAt: Date.now(),
+          entries: apiLedger.entries,
+        });
+        if (Object.keys(apiLedger.titles).length > 0) {
+          setBotTitlesByConn((prev) => ({
+            ...prev,
+            [connScopeKey]: { ...(prev[connScopeKey] || {}), ...apiLedger.titles },
+          }));
+        }
+        if (Object.keys(apiLedger.metaByProfile).length > 0) {
+          setMetaByConn((prev) => ({
+            ...prev,
+            [connScopeKey]: { ...(prev[connScopeKey] || {}), ...apiLedger.metaByProfile },
+          }));
+        }
+        if (apiLedger.names.length > 0) {
+          setProfileNamesByConn((prev) => {
+            const cur = prev[connScopeKey] || [];
+            const mergedSet = new Set([...cur, ...apiLedger.names, profileSlug].filter(Boolean));
+            const nextList = Array.from(mergedSet).sort();
+            if (nextList.join(',') === cur.join(',')) return prev;
+            return { ...prev, [connScopeKey]: nextList };
+          });
+        }
+        setScopedSessions(sliceEntriesForScope(apiLedger.entries));
+        setScopeLoading(false);
+        return;
+      }
+
+      // If a secondary profile had not enabled the dashboard API yet, reuse a fresh connection-wide `/ledger` snapshot if available
+      const cachedApi = isWindowPrimaryConn ? ledgerApiCacheRef.current.get(connScopeKey) : null;
+      if (cachedApi && Date.now() - cachedApi.fetchedAt < 60_000) {
+        setScopedSessions(sliceEntriesForScope(cachedApi.entries));
+        setScopeLoading(false);
+        return;
+      }
+
+      const allRows = await collectProfileSessionsForScope({
+        targetProfiles,
+        connScopeKey,
+        effectiveConnId,
+        routeMap,
+        canonicalByProfile,
+        metaByProfile,
+        botChatCache: botChatCacheRef.current,
+        activeIds,
+        forceRefresh,
+      });
+      if (cancelled) return;
+      setScopedSessions(allRows);
+      setScopeLoading(false);
+    })().catch(() => {
+      if (cancelled) return;
       setScopeLoading(false);
     });
 
     return () => {
       cancelled = true;
     };
-  }, [prefs.usageScope, prefs.timeRange, ownerConnId, profileSlug, profileNames, refreshNonce]);
+  }, [
+    ctx,
+    isWindowPrimaryConn,
+    prefs.usageScope,
+    prefs.timeRange,
+    connScopeKey,
+    effectiveConnId,
+    profileSlug,
+    profileNamesKey,
+    routeMap,
+    canonicalByProfile,
+    metaByProfile,
+    candidateIdsKey,
+    refreshNonce,
+  ]);
 
   // 5. Refresh when a turn finishes
   React.useEffect(() => {
@@ -2899,33 +4018,57 @@ function ContextBarChip({ ctx }) {
     setCompactState('working');
     setCompactMsg(t.compacting);
     try {
-      const route = resolveRoute({ connectionId: ownerConnId, profile: profileSlug }, profileSlug);
-      const res = await gwCall(route, 'session.compress', { session_id: sessionId });
+      const route = resolveRoute({ connectionId: effectiveConnId, profile: profileSlug }, profileSlug, routeMap);
+      const res = await gwCall(route, 'session.compress', { session_id: sessionId }, profileSlug);
       if (res?.status === 'aborted' || res?.compressed === false) {
         setCompactState('idle');
         setCompactMsg(t.compactSkipped);
       } else {
         setCompactState('done');
         setCompactMsg(res?.status === 'pending' ? t.compactQueued : t.compactDone);
-        globalThis.setTimeout(() => setRefreshNonce((n) => n + 1), 800);
+        if (compactTimerRef.current !== null) globalThis.clearTimeout(compactTimerRef.current);
+        compactTimerRef.current = globalThis.setTimeout(() => {
+          compactTimerRef.current = null;
+          setRefreshNonce((n) => n + 1);
+        }, 800);
       }
     } catch (err) {
       setCompactState('error');
       setCompactMsg(err instanceof Error ? err.message : t.compactFailed);
     }
-  }, [sessionId, busy, compactState, ownerConnId, profileSlug, t]);
+  }, [sessionId, busy, compactState, effectiveConnId, profileSlug, routeMap, t]);
 
-  // ---- Derive Metrics ----
-  const merged = mergeUsageSources(liveUsage, rpcUsage, persistedSession, breakdown);
-  const categories = normalizeCategories(breakdown, prefs.themeSkin, t);
-  const modelName = resolveModelName(liveUsage, rpcUsage, persistedSession, rawModel);
+  // ---- Derive Metrics (Strictly gate async state by `_sid` / `_profile` on first frame after bot switch!) ----
+  const liveExplicitSid = String(liveUsage?.session_id || liveUsage?.sessionId || '').trim();
+  const liveSidAligned = !liveExplicitSid || candidateIds.includes(liveExplicitSid);
+  const alignedLiveUsage = liveSidAligned ? liveUsage : null;
+  const alignedRpcUsage = sessionId && rpcUsage?._sid === sessionId ? rpcUsage : null;
+  const alignedPersisted = sessionId && persistedSession?._sid === sessionId ? persistedSession : null;
+  const alignedBreakdown = sessionId && breakdown?._sid === sessionId ? breakdown : null;
+  const alignedProfileHint =
+    profileRouteHint && profileRouteHint._profile === profileSlug ? profileRouteHint : null;
+
+  const merged = mergeUsageSources(alignedLiveUsage, alignedRpcUsage, alignedPersisted, alignedBreakdown);
+  const categories = normalizeCategories(alignedBreakdown, prefs.themeSkin, t);
+  const modelName = resolveModelName(alignedLiveUsage, alignedRpcUsage, alignedPersisted, rawModel);
   const botName = botTitles[profileSlug] || profileSlug;
   const activeRouteHint =
-    rawModel && typeof rawModel === 'object' ? rawModel : profileRouteHint;
-  const sessionCost = estimateSessionCost(merged, modelName, liveUsage, rpcUsage, persistedSession, activeRouteHint);
+    rawModel && typeof rawModel === 'object' ? rawModel : alignedProfileHint;
+  const sessionCost = estimateSessionCost(
+    merged,
+    modelName,
+    alignedLiveUsage,
+    alignedRpcUsage,
+    alignedPersisted,
+    activeRouteHint
+  );
 
   const isMultiSessionScope = prefs.usageScope !== 'session';
   const scopeLabel = buildScopeLabel(prefs, botName, profileNames.length, t);
+  // While multi-profile sessions are loading for the very first time (`scopeLoading && scopedSessions.length === 0`),
+  // suppress active-live-only fallback in `all` mode so switching bots never flashes single-bot spend!
+  const allowActiveLiveFallback =
+    prefs.usageScope !== 'all' || !scopeLoading || scopedSessions.length > 0;
   const scopedAgg = isMultiSessionScope
     ? aggregatePersistedSessions(
         scopedSessions,
@@ -2934,14 +4077,40 @@ function ContextBarChip({ ctx }) {
         merged,
         modelName,
         Date.now(),
-        liveUsage,
-        rpcUsage,
-        persistedSession,
-        activeRouteHint
+        alignedLiveUsage,
+        alignedRpcUsage,
+        alignedPersisted,
+        activeRouteHint,
+        {
+          __aggOpts: true,
+          activeProfileSlug: profileSlug,
+          connScopeKey,
+          ledger: ledgerRef.current,
+          mutateLedger: false,
+          liveSidAligned: Boolean(sessionId) && liveSidAligned,
+          includeActiveLive: allowActiveLiveFallback,
+        }
       )
     : null;
 
-  const displayInput = isMultiSessionScope ? scopedAgg.input : merged.input;
+  React.useEffect(() => {
+    if (!scopedAgg?.observations?.length || !ledgerRef.current) return;
+    let changed = false;
+    for (const obs of scopedAgg.observations) {
+      if (recordLedgerObservation(ledgerRef.current, obs.dayKey, obs.sessionKey, obs.snapshot)) {
+        changed = true;
+      }
+    }
+    if (changed) {
+      saveUsageLedger(ctx, ledgerRef.current);
+    }
+  }, [ctx, scopedAgg]);
+
+  const displayFreshInput = isMultiSessionScope ? scopedAgg.input : merged.input;
+  const displayCacheRead = isMultiSessionScope ? scopedAgg.cacheRead : merged.cacheRead;
+  const displayPromptTokens = isMultiSessionScope
+    ? scopedAgg.promptTokens
+    : (merged.promptTokens ?? merged.input);
   const displayOutput = isMultiSessionScope ? scopedAgg.output : merged.output;
   const displayTotal = isMultiSessionScope ? scopedAgg.total : merged.total;
   const displayCostAmount = isMultiSessionScope ? scopedAgg.costUsd : sessionCost.amount;
@@ -3057,16 +4226,18 @@ function ContextBarChip({ ctx }) {
 
   const consumptionParts = [];
   if (prefs.showTokens) {
-    const hasTok = (displayInput ?? 0) > 0 || (displayOutput ?? 0) > 0;
+    const hasTok = (displayPromptTokens ?? 0) > 0 || (displayOutput ?? 0) > 0;
     consumptionParts.push(
       h(
         'span',
         { key: 'tok', className: 'lub-chip-muted' },
         !hasTok
           ? '—'
-          : prefs.tokenDisplay === 'total'
-            ? fmtCompact(displayTotal ?? 0)
-            : `↑${fmtCompact(displayInput ?? 0)} ↓${fmtCompact(displayOutput ?? 0)}`
+          : scopeLoading && scopedSessions.length === 0 && isMultiSessionScope
+            ? '…'
+            : prefs.tokenDisplay === 'total'
+              ? fmtCompact(displayTotal ?? 0)
+              : `↑${fmtCompact(displayPromptTokens ?? 0)} ↓${fmtCompact(displayOutput ?? 0)}`
       )
     );
   }
@@ -3075,7 +4246,11 @@ function ContextBarChip({ ctx }) {
       h(
         'span',
         { key: 'cost', className: 'lub-chip-primary' },
-        displayCostAmount != null ? fmtCurrency(displayCostAmount, displayCostEstimated, prefs) : '—'
+        scopeLoading && scopedSessions.length === 0 && isMultiSessionScope
+          ? '…'
+          : displayCostAmount != null
+            ? fmtCurrency(displayCostAmount, displayCostEstimated, prefs)
+            : '—'
       )
     );
   }
@@ -3352,7 +4527,8 @@ function ContextBarChip({ ctx }) {
         ? h(
             'div',
             { className: 'lub-grid' },
-            kvRow('in', t.input, fmtFull(displayInput)),
+            kvRow('in', t.input, fmtFull(displayFreshInput)),
+            kvRow('cr', t.cachedInput, fmtFull(displayCacheRead)),
             kvRow('out', t.output, fmtFull(displayOutput)),
             kvRow('tot', t.total, fmtFull(displayTotal)),
             kvRow('cnt', t.sessions, t.sessionsUnit(scopedAgg.sessionCount))
@@ -3361,6 +4537,7 @@ function ContextBarChip({ ctx }) {
             'div',
             { className: 'lub-grid' },
             kvRow('in', t.input, fmtFull(merged.input)),
+            kvRow('cr', t.cachedInput, merged.cacheRead != null ? fmtFull(merged.cacheRead) : '—'),
             kvRow('out', t.output, fmtFull(merged.output)),
             kvRow('reason', t.reasoning, merged.reasoning != null ? fmtFull(merged.reasoning) : '—'),
             kvRow('tot', t.total, fmtFull(merged.total)),
